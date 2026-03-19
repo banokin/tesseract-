@@ -17,7 +17,7 @@
 2. Запустите API:
    
    uvicorn main:app --reload --port 8000
-   ```
+   
 3. Запустите интерфейс в отдельном терминале:
  
    streamlit run streamlit_app.py
