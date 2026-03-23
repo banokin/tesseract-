@@ -1,4 +1,6 @@
 import hashlib
+from pathlib import Path
+
 import requests
 import streamlit as st
 
@@ -9,12 +11,25 @@ OCR_API_URL = f"{API_BASE_URL}/ocr"
 OCR_TO_CONTRACT_API_URL = f"{API_BASE_URL}/ocr-to-contract"
 MAX_FILE_SIZE_BYTES = 1024 * 1024 * 1024  # 1 GB
 
+_BLOCKED_EXTENSIONS = {".mp3", ".pdf", ".docx", ".doc", ".txt"}
+_BLOCKED_TYPES = {
+    "audio/mpeg",
+    "audio/mp3",
+    "application/pdf",
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    "application/msword",
+    "text/plain",
+}
+
 st.title("Договор по фотографии")
 st.write(
     "Загрузите фото — договор заполнится автоматически (OCR + шаблон). "
     "Ниже появится кнопка скачивания готового файла .docx."
 )
-st.caption("Ограничения: файлы 1 ГБ и больше не принимаются. Файлы MP3 не поддерживаются.")
+st.caption(
+    "Ограничения: файлы от 1 ГБ и больше не принимаются. "
+    "MP3, PDF, DOC/DOCX, TXT для OCR не подходят — Tesseract обрабатывает только изображения (PNG, JPG, JPEG)."
+)
 
 
 def show_api_error(response):
@@ -48,8 +63,15 @@ filename_lower = (uploaded_file.name or "").lower()
 if len(uploaded_raw) >= MAX_FILE_SIZE_BYTES:
     st.error("Файл слишком большой: 1 ГБ и больше не принимаются.")
     st.stop()
-if filename_lower.endswith(".mp3") or uploaded_file.type in {"audio/mpeg", "audio/mp3"}:
-    st.error("Файлы MP3 не поддерживаются. Загрузите изображение PNG/JPG/JPEG.")
+ext = Path(filename_lower).suffix
+upload_type = (uploaded_file.type or "").split(";")[0].strip().lower()
+if ext in _BLOCKED_EXTENSIONS or upload_type in _BLOCKED_TYPES:
+    if ext == ".mp3" or upload_type in {"audio/mpeg", "audio/mp3"}:
+        st.error("Файлы MP3 не поддерживаются. Загрузите изображение PNG/JPG/JPEG.")
+    else:
+        st.error(
+            "Файлы PDF, DOC/DOCX и TXT для OCR не поддерживаются — загрузите фото PNG, JPG или JPEG."
+        )
     st.stop()
 
 st.image(uploaded_file, caption="Загруженное изображение")

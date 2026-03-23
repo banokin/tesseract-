@@ -96,6 +96,21 @@ def test_ocr_mp3_returns_415(client):
     assert "mp3" in r.json()["detail"].lower()
 
 
+@pytest.mark.parametrize(
+    "name,content_type,payload",
+    [
+        ("scan.pdf", "application/pdf", b"%PDF-1.4"),
+        ("doc.docx", "application/vnd.openxmlformats-officedocument.wordprocessingml.document", b"PK\x03\x04"),
+        ("note.txt", "text/plain", b"hello"),
+    ],
+)
+def test_ocr_pdf_docx_txt_returns_415(client, name, content_type, payload):
+    r = client.post("/ocr", files={"file": (name, payload, content_type)})
+    assert r.status_code == 415
+    detail = r.json()["detail"].lower()
+    assert "png" in detail or "jpeg" in detail or "jpg" in detail
+
+
 def test_ocr_too_large_returns_413(client, monkeypatch):
     monkeypatch.setattr(ocr, "MAX_FILE_SIZE_BYTES", 10)
     r = client.post(
@@ -178,6 +193,14 @@ def test_ocr_to_contract_mp3_returns_415(client):
     )
     assert r.status_code == 415
     assert "mp3" in r.json()["detail"].lower()
+
+
+def test_ocr_to_contract_pdf_returns_415(client):
+    r = client.post(
+        "/ocr-to-contract",
+        files={"file": ("x.pdf", b"%PDF-1.4", "application/pdf")},
+    )
+    assert r.status_code == 415
 
 
 def test_ocr_to_contract_too_large_returns_413(client, monkeypatch):

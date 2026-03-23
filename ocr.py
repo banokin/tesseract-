@@ -13,6 +13,22 @@ from concurrency import run_blocking
 router = APIRouter(tags=["ocr"])
 MAX_FILE_SIZE_BYTES = 1024 * 1024 * 1024  # 1 GB
 
+# Tesseract работает с растром; PDF/DOCX/TXT напрямую не поддерживаются.
+_BLOCKED_OCR_EXTENSIONS = frozenset({".pdf", ".docx", ".doc", ".txt"})
+_BLOCKED_OCR_CONTENT_TYPES = frozenset(
+    {
+        "application/pdf",
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        "application/msword",
+        "text/plain",
+    }
+)
+
+_OCR_UNSUPPORTED_DETAIL = (
+    "Для OCR поддерживаются только изображения (PNG, JPG, JPEG). "
+    "Файлы PDF, DOCX и TXT Tesseract не сканирует как документы — конвертируйте страницу в изображение или извлеките текст другими средствами."
+)
+
 
 def img_ocr(contents: bytes) -> str:
     image = Image.open(io.BytesIO(contents))
@@ -32,6 +48,13 @@ def validate_upload(file: UploadFile, contents: bytes) -> None:
     ext = Path(filename).suffix
     if ext == ".mp3" or file.content_type in {"audio/mpeg", "audio/mp3"}:
         raise HTTPException(status_code=415, detail="Файлы MP3 не поддерживаются.")
+
+    if ext in _BLOCKED_OCR_EXTENSIONS:
+        raise HTTPException(status_code=415, detail=_OCR_UNSUPPORTED_DETAIL)
+
+    ct = (file.content_type or "").split(";")[0].strip().lower()
+    if ct in _BLOCKED_OCR_CONTENT_TYPES:
+        raise HTTPException(status_code=415, detail=_OCR_UNSUPPORTED_DETAIL)
 
 
 @router.post("/ocr")
