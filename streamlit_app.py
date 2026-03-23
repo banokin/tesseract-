@@ -7,12 +7,14 @@ st.set_page_config(page_title="OCR и договор", page_icon="📄")
 API_BASE_URL = "http://127.0.0.1:8000"
 OCR_API_URL = f"{API_BASE_URL}/ocr"
 OCR_TO_CONTRACT_API_URL = f"{API_BASE_URL}/ocr-to-contract"
+MAX_FILE_SIZE_BYTES = 1024 * 1024 * 1024  # 1 GB
 
 st.title("Договор по фотографии")
 st.write(
     "Загрузите фото — договор заполнится автоматически (OCR + шаблон). "
     "Ниже появится кнопка скачивания готового файла .docx."
 )
+st.caption("Ограничения: файлы 1 ГБ и больше не принимаются. Файлы MP3 не поддерживаются.")
 
 
 def show_api_error(response):
@@ -39,6 +41,15 @@ uploaded_file = st.file_uploader(
 if uploaded_file is None:
     if "contract_cache" in st.session_state:
         st.session_state.contract_cache = {}
+    st.stop()
+
+uploaded_raw = uploaded_file.getvalue()
+filename_lower = (uploaded_file.name or "").lower()
+if len(uploaded_raw) >= MAX_FILE_SIZE_BYTES:
+    st.error("Файл слишком большой: 1 ГБ и больше не принимаются.")
+    st.stop()
+if filename_lower.endswith(".mp3") or uploaded_file.type in {"audio/mpeg", "audio/mp3"}:
+    st.error("Файлы MP3 не поддерживаются. Загрузите изображение PNG/JPG/JPEG.")
     st.stop()
 
 st.image(uploaded_file, caption="Загруженное изображение")
