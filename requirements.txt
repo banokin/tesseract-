@@ -30,6 +30,7 @@ pydeck==0.9.1
 pytesseract==0.3.13
 pytest==9.0.1
 python-docx
+docxtpl
 python-dateutil==2.9.0.post0
 python-multipart==0.0.22
 pytz==2026.1.post1

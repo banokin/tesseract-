@@ -85,6 +85,7 @@ if cache.get("key") != key:
     cache.pop("filename", None)
     cache.pop("err", None)
     cache.pop("ocr_text", None)
+    cache.pop("json_data", None)
 
     with st.spinner("Распознаю текст и заполняю договор..."):
         try:
@@ -122,6 +123,7 @@ if cache.get("key") != key:
                             or "filled_contract.docx"
                         )
                         cache["ocr_text"] = data.get("ocr_text", "")
+                        cache["json_data"] = data.get("json_data")
         except requests.exceptions.ConnectionError:
             cache["err"] = "connection"
         except requests.exceptions.Timeout:
@@ -145,6 +147,9 @@ elif cache.get("docx"):
         file_name=cache["filename"],
         mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
     )
+    if cache.get("json_data") and st.button("Показать JSON после сканирования"):
+        st.subheader("JSON для заполнения договора")
+        st.json(cache["json_data"])
     if cache.get("ocr_text"):
         with st.expander("Распознанный текст (OCR)"):
             st.text_area("Текст", cache["ocr_text"], height=240, disabled=True)

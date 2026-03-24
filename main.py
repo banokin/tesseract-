@@ -1,11 +1,12 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from concurrency import lifespan
 from dogovor import router as dogovor_router
 from ocr import router as ocr_router
 
-app = FastAPI(lifespan=lifespan)
+app = FastAPI(
+    title="Сканер для договоров",
+)
 
 app.add_middleware(
     CORSMiddleware,
