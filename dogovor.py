@@ -13,7 +13,6 @@ from ocr import extract_text_from_upload
 router = APIRouter(tags=["dogovor"])
 
 BASE_DIR = Path(__file__).resolve().parent
-# Шаблон эксклюзивного договора (docxtpl): «шаблон договора.docx» в корне проекта
 TEMPLATE_PATH = BASE_DIR / "шаблон договора.docx"
 OUTPUT_DIR = BASE_DIR / "generated_docs"
 OUTPUT_DIR.mkdir(exist_ok=True)
@@ -89,82 +88,62 @@ def extract_fields(text: str) -> dict:
     cust_text = _section_text(text, "заказчик")
 
     fields = {
-        # город договора (без захвата следующей строки «ДОГОВОР …»)
-        "contract_city": _find(
-            r"г\.\s*([А-ЯЁA-Zа-яёa-z\-]+(?:[ \t]+[А-ЯЁA-Zа-яёa-z\-]+)*)",
-            text,
-        ),
+        # город договора 
+        "contract_city": _find( r"г\.\s*([А-ЯЁA-Zа-яёa-z\-]+(?:[ \t]+[А-ЯЁA-Zа-яёa-z\-]+)*)", text),
 
         # договор
         "contract_number": _find(r"договор\s*№\s*([A-Za-zА-Яа-я0-9\-\/]+)", text),
+        
         "contract_date": _find(r"дата договора[:\-]?\s*(\d{2}\.\d{2}\.\d{4})", text),
 
         # исполнитель (часто в форме: «Адрес регистрации:», «р/с», «к/с» без слова «исполнителя»)
         "executor_name": _find(r"фио исполнителя[:\-]?\s*(.+)", text),
-        "executor_address": _find(
-            r"адрес\s+регистрации\s+исполнителя[:\-]?\s*(.+)", text
-        )
-        or _find(r"адрес\s+регистрации[:\-]?\s*(.+)", exec_text)
-        or _find(r"адрес\s+исполнителя[:\-]?\s*(.+)", text),
-        "executor_phone": _find(r"телефон исполнителя[:\-]?\s*([\+\d\(\)\-\s]+)", text)
-        or _find(r"(?:тел\.?|телефон)[:\-]?\s*([\+\d\(\)\-\s]+)", exec_text),
-        "executor_email": _find(r"email исполнителя[:\-]?\s*([^\s]+)", text)
-        or _find(r"(?:email|e-?mail|почта)[:\-]?\s*([^\s]+)", exec_text),
-        "executor_inn": _find(r"инн исполнителя[:\-]?\s*(\d+)", text)
-        or _find(r"инн[:\-]?\s*(\d{10,12})", exec_text),
-        "executor_ogrn": _find(r"огрн исполнителя[:\-]?\s*(\d+)", text)
-        or _find(r"огрн[:\-]?\s*(\d+)", exec_text),
-        "executor_bik": _find(r"бик\s+исполнителя[:\-]?\s*(\d{8,9})", text)
-        or _find(r"бик[:\-]?\s*(\d{8,9})", exec_text),
-        "executor_bank": _find(
-            r"(?:банк|наименование\s+банка)\s+исполнителя[:\-]?\s*(.+)", text
-        )
-        or _find(r"банк[:\-]?\s*(.+)", exec_text),
-        "executor_rs": _find(
-            r"(?:р[/\\]?с|расч[её]тный\s+сч[её]т)\s+исполнителя[:\-]?\s*([\d\s]+)",
-            text,
-        )
-        or _find(r"(?:р[/\\]?с|р\s*\.\s*с)[:\-]?\s*([\d\s]+)", exec_text),
-        "executor_ks": _find(
-            r"(?:корреспондентск\w*\s+сч[её]т|к[/\\]?с|корр\.?\s*сч[её]т)\s+исполнителя[:\-]?\s*([\d\s]+)",
-            text,
-        )
-        or _find(
-            r"корреспондентск\w*\s+сч[её]т[:\-]?\s*([\d\s]+)",
-            exec_text,
-        )
-        or _find(r"(?:к[/\\]?с|к\s*\.\s*с)[:\-]?\s*([\d\s]+)", exec_text),
+        
+        "executor_address": _find(r"адрес\s+регистрации\s+исполнителя[:\-]?\s*(.+)", text),
+        
+        "executor_phone": _find(r"телефон исполнителя[:\-]?\s*([\+\d\(\)\-\s]+)", text),
+
+        
+        "executor_email": _find(r"email исполнителя[:\-]?\s*([^\s]+)", text),
+        
+        "executor_inn": _find(r"инн исполнителя[:\-]?\s*(\d+)", text),
+
+        
+        "executor_ogrn": _find(r"огрн исполнителя[:\-]?\s*(\d+)", text),
+   
+        
+        "executor_bik": _find(r"бик\s+исполнителя[:\-]?\s*(\d{8,9})", text),
+      
+        
+        "executor_bank": _find( r"(?:банк|наименование\s+банка)\s+исполнителя[:\-]?\s*(.+)", text),
+
+        
+        "executor_rs": _find( r"(?:р[/\\]?с|расч[её]тный\s+сч[её]т)\s+исполнителя[:\-]?\s*([\d\s]+)", text),
+
+        "executor_ks": _find( r"(?:корреспондентск\w*\s+сч[её]т|к[/\\]?с|корр\.?\s*сч[её]т)\s+исполнителя[:\-]?\s*([\d\s]+)", text),
 
         # заказчик
         "customer_fio": _find(r"фио заказчика[:\-]?\s*(.+)", text),
-        "customer_registration_address": _find(
-            r"адрес\s+регистрации\s+заказчика[:\-]?\s*(.+)", text
-        )
-        or _find(
-            r"адрес\s+регистрац(?:ии)?\s+заказчика[:\-]?\s*(.+)", text
-        )
-        or _find(r"адрес\s+регистрац(?:ии)?[:\-]?\s*(.+)", cust_text),
-        "customer_phone": _find(r"телефон заказчика[:\-]?\s*([\+\d\(\)\-\s]+)", text),
-        "customer_email": _find(r"email заказчика[:\-]?\s*([^\s]+)", text),
+        
+        "customer_registration_address": _find( r"адрес\s+регистрации\s+заказчика[:\-]?\s*(.+)", text),
 
-        # паспорт
-        "passport_series": _find(r"серия[:\-]?\s*(\d{4})", text),
-        "passport_number": _find(r"номер[:\-]?\s*(\d{6})", text),
-        "passport_issued_by": _find(r"выдан[:\-]?\s*(.+)", text),
-        "passport_issue_date": _find(r"дата выдачи[:\-]?\s*(\d{2}\.\d{2}\.\d{4})", text),
-        "passport_code": _find(r"код подразделения[:\-]?\s*([\d\-]+)", text),
-        "birth_place": _find(
-            r"место\s+рождения(?:\s+заказчика)?[:\-]?\s*(.+)", text
-        ),
-        "birth_date": _find(
-            r"дата\s+рождения(?:\s+заказчика)?[:\-]?\s*(\d{2}\.\d{2}\.\d{4})", text
-        ),
+        "customer_phone": _find(r"телефон заказчика[:\-]?\s*([\+\d\(\)\-\s]+)", text),
+       
+        "customer_email": _find(r"email заказчика[:\-]?\s*([^\s]+)", text),
+        
+        "birth_place": _find( r"место\s+рождения(?:\s+заказчика)?[:\-]?\s*(.+)", text),
+        
+        "birth_date": _find( r"дата\s+рождения(?:\s+заказчика)?[:\-]?\s*(\d{2}\.\d{2}\.\d{4})", text),
 
         # объект
         "property_name": _find(r"название объекта[:\-]?\s*(.+)", text),
+        
         "property_purpose": _find(r"назначение объекта[:\-]?\s*(.+)", text),
+        
         "property_area": _find(r"площадь объекта[:\-]?\s*([\d\.]+)", text),
+        
         "property_address": _find(r"адрес объекта[:\-]?\s*(.+)", text),
+        
         "property_cadastral_number": _find(r"кадастровый номер[:\-]?\s*([0-9:\-]+)", text),
 
         # основание
@@ -175,7 +154,6 @@ def extract_fields(text: str) -> dict:
 
 
 def parse_ocr_to_contract_data(text: str) -> ContractData:
-    """Собирает ContractData из результата extract_fields (единый набор regex)."""
     return ContractData.model_validate(extract_fields(text))
 
 
