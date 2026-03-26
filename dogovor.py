@@ -67,10 +67,7 @@ def _find(pattern: str, text: str, default: str = "") -> str:
 
 
 def _section_text(text: str, header: str) -> str:
-    """
-    Возвращает текст секции по заголовку независимо от порядка блоков.
-    Секция идет от заголовка до ближайшего другого известного заголовка.
-    """
+   
     headers = ("исполнитель", "заказчик", "паспорт", "объект")
     start_match = re.search(rf"(?im)^\s*{header}(?:\s+\w+)?\s*:?\s*$", text)
     if not start_match:

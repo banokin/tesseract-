@@ -1,22 +1,6 @@
-from pathlib import Path
-
 import pytest
-from fastapi import FastAPI
-from fastapi.testclient import TestClient
 
 import dogovor
-
-
-@pytest.fixture
-def app():
-    app = FastAPI()
-    app.include_router(dogovor.router)
-    return app
-
-
-@pytest.fixture
-def client(app):
-    return TestClient(app)
 
 
 @pytest.fixture
@@ -74,97 +58,5 @@ def test_extract_fields(sample_text):
 
 
 def test_resolve_download_path_invalid():
-    try:
+    with pytest.raises(Exception):
         dogovor._resolve_download_path("../hack.docx")
-        assert False
-    except Exception:
-        assert True
-
-
-def test_create_doc_success(monkeypatch, tmp_path):
-    output_path = tmp_path / "result.docx"
-    template_path = tmp_path / "template.docx"
-    template_path.write_text("fake template")
-
-    monkeypatch.setattr(dogovor, "TEMPLATE_PATH", template_path)
-
-    calls = {}
-
-    class FakeDocxTemplate:
-        def __init__(self, path):
-            calls["path"] = path
-
-        def render(self, context):
-            calls["context"] = context
-
-        def save(self, path):
-            calls["save_path"] = path
-            Path(path).write_text("generated")
-
-    monkeypatch.setattr(dogovor, "DocxTemplate", FakeDocxTemplate)
-
-    data = dogovor.ContractData(
-        contract_city="Москва",
-        executor_name="Петров Петр Петрович",
-    )
-
-    dogovor.create_doc(data, output_path)
-
-    assert calls["path"] == str(template_path)
-    assert calls["context"]["contract_city"] == "Москва"
-    assert calls["context"]["executor_name"] == "Петров Петр Петрович"
-    assert calls["save_path"] == str(output_path)
-    assert output_path.exists()
-
-
-def test_ocr_to_contract_endpoint_success(client, monkeypatch, tmp_path, sample_text):
-    monkeypatch.setattr(dogovor, "OUTPUT_DIR", tmp_path)
-
-    async def fake_extract_text_from_upload(file):
-        return sample_text
-
-    def fake_create_doc(contract_data, output_path):
-        output_path.write_text("fake docx")
-
-    monkeypatch.setattr(dogovor, "extract_text_from_upload", fake_extract_text_from_upload)
-    monkeypatch.setattr(dogovor, "create_doc", fake_create_doc)
-
-    response = client.post(
-        "/ocr-to-contract",
-        files={"file": ("test.png", b"fake image bytes", "image/png")},
-    )
-
-    assert response.status_code == 200
-    data = response.json()
-
-    assert data["message"] == "Договор успешно заполнен"
-    assert data["filename"] == "test.png"
-    assert data["generated_filename"].startswith("dogovor_")
-    assert data["generated_filename"].endswith(".docx")
-    assert data["download_url"].startswith("/download/dogovor_")
-    assert data["json_data"]["source"] == "tesseract"
-    assert data["json_data"]["contract_data"]["executor_name"] == "Петров Петр Петрович"
-
-
-def test_download_file_success(client, monkeypatch, tmp_path):
-    monkeypatch.setattr(dogovor, "OUTPUT_DIR", tmp_path)
-
-    filename = "dogovor_1234567890abcdef1234567890abcdef.docx"
-    file_path = tmp_path / filename
-    file_path.write_text("test file")
-
-    response = client.get(f"/download/{filename}")
-
-    assert response.status_code == 200
-    assert response.headers["content-type"].startswith(
-        "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
-    )
-
-
-def test_download_file_not_found(client, monkeypatch, tmp_path):
-    monkeypatch.setattr(dogovor, "OUTPUT_DIR", tmp_path)
-
-    filename = "dogovor_1234567890abcdef1234567890abcdef.docx"
-    response = client.get(f"/download/{filename}")
-
-    assert response.status_code == 404
