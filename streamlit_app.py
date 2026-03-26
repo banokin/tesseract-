@@ -1,4 +1,3 @@
-import hashlib
 from pathlib import Path
 
 import requests
@@ -21,6 +20,12 @@ _BLOCKED_TYPES = {
     "text/plain",
 }
 
+
+def blocked_upload_error_message(ext: str, upload_type: str) -> str:
+    if ext == ".mp3" or upload_type in {"audio/mpeg", "audio/mp3"}:
+        return "Файлы MP3 не поддерживаются. Загрузите изображение PNG/JPG/JPEG."
+    return "Файлы PDF, DOC/DOCX и TXT для OCR не поддерживаются — загрузите фото PNG, JPG или JPEG."
+
 st.title("Договор по фотографии")
 st.write(
     "Загрузите фото — договор заполнится автоматически (OCR + шаблон). "
@@ -41,21 +46,12 @@ def show_api_error(response):
         st.write(response.text)
 
 
-def file_cache_key(uploaded_file) -> str:
-    """Стабильный ключ по имени и содержимому (размер + хэш начала файла)."""
-    raw = uploaded_file.getvalue()
-    h = hashlib.sha256(raw[:65536]).hexdigest()[:16]
-    return f"{uploaded_file.name}|{len(raw)}|{h}"
-
-
 uploaded_file = st.file_uploader(
     "Выберите изображение",
     type=["png", "jpg", "jpeg"],
 )
 
 if uploaded_file is None:
-    if "contract_cache" in st.session_state:
-        st.session_state.contract_cache = {}
     st.stop()
 
 uploaded_raw = uploaded_file.getvalue()
@@ -63,113 +59,82 @@ filename_lower = (uploaded_file.name or "").lower()
 if len(uploaded_raw) >= MAX_FILE_SIZE_BYTES:
     st.error("Файл слишком большой: 1 ГБ и больше не принимаются.")
     st.stop()
+
 ext = Path(filename_lower).suffix
+
 upload_type = (uploaded_file.type or "").split(";")[0].strip().lower()
+
 if ext in _BLOCKED_EXTENSIONS or upload_type in _BLOCKED_TYPES:
-    if ext == ".mp3" or upload_type in {"audio/mpeg", "audio/mp3"}:
-        st.error("Файлы MP3 не поддерживаются. Загрузите изображение PNG/JPG/JPEG.")
-    else:
-        st.error(
-            "Файлы PDF, DOC/DOCX и TXT для OCR не поддерживаются — загрузите фото PNG, JPG или JPEG."
-        )
+    st.error(blocked_upload_error_message(ext, upload_type))
     st.stop()
 
 st.image(uploaded_file, caption="Загруженное изображение")
 
-cache = st.session_state.setdefault("contract_cache", {})
-key = file_cache_key(uploaded_file)
+err = None
+docx = None
+filename = None
+ocr_text = ""
+json_data = None
 
-if cache.get("key") != key:
-    cache["key"] = key
-    cache.pop("docx", None)
-    cache.pop("filename", None)
-    cache.pop("err", None)
-    cache.pop("ocr_text", None)
-    cache.pop("json_data", None)
-
-    with st.spinner("Распознаю текст и заполняю договор..."):
-        try:
-            files = {
-                "file": (
-                    uploaded_file.name,
-                    uploaded_file.getvalue(),
-                    uploaded_file.type,
-                )
-            }
-            response = requests.post(
-                OCR_TO_CONTRACT_API_URL,
-                files=files,
-                timeout=120,
+with st.spinner("Распознаю текст и заполняю договор..."):
+    try:
+        files = {
+            "file": (
+                uploaded_file.name,
+                uploaded_file.getvalue(),
+                uploaded_file.type,
             )
-            if response.status_code != 200:
-                cache["err"] = response
+        }
+        response = requests.post(
+            OCR_TO_CONTRACT_API_URL,
+            files=files,
+            timeout=120,
+        )
+        if response.status_code != 200:
+            err = response
+        else:
+            data = response.json()
+            download_url = data.get("download_url")
+            if not download_url:
+                err = "API не вернул ссылку на файл договора."
             else:
-                data = response.json()
-                download_url = data.get("download_url")
-                if not download_url:
-                    cache["err"] = "API не вернул ссылку на файл договора."
+                file_response = requests.get(
+                    f"{API_BASE_URL}{download_url}",
+                    timeout=120,
+                )
+                if file_response.status_code == 200:
+                    docx = file_response.content
+                    filename = data.get("generated_filename") or download_url.rsplit("/", 1)[-1]
+                    ocr_text = data.get("ocr_text", "")
+                    json_data = data.get("json_data")
                 else:
-                    file_response = requests.get(
-                        f"{API_BASE_URL}{download_url}",
-                        timeout=120,
-                    )
-                    if file_response.status_code != 200:
-                        cache["err"] = file_response
-                    else:
-                        cache["docx"] = file_response.content
-                        cache["filename"] = (
-                            data.get("generated_filename")
-                            or download_url.rsplit("/", 1)[-1]
-                            or "filled_contract.docx"
-                        )
-                        cache["ocr_text"] = data.get("ocr_text", "")
-                        cache["json_data"] = data.get("json_data")
-        except requests.exceptions.ConnectionError:
-            cache["err"] = "connection"
-        except requests.exceptions.Timeout:
-            cache["err"] = "timeout"
-        except Exception as e:
-            cache["err"] = str(e)
+                    err = file_response
+    except requests.exceptions.ConnectionError:
+        err = "connection"
+    except requests.exceptions.Timeout:
+        err = "timeout"
+    except Exception as e:
+        err = str(e)
 
-if cache.get("err") == "connection":
+if err == "connection":
     st.error("Не удалось подключиться к FastAPI. Запустите сервер: `uvicorn dogovor:app --reload`")
-elif cache.get("err") == "timeout":
+elif err == "timeout":
     st.error("Сервер отвечает слишком долго.")
-elif isinstance(cache.get("err"), str) and cache["err"]:
-    st.error(cache["err"])
-elif hasattr(cache.get("err"), "status_code"):
-    show_api_error(cache["err"])
-elif cache.get("docx"):
+elif isinstance(err, str) and err:
+    st.error(err)
+elif hasattr(err, "status_code"):
+    show_api_error(err)
+elif docx:
     st.success("Договор сформирован по данным с фото.")
     st.download_button(
         label="Скачать заполненный договор (.docx)",
-        data=cache["docx"],
-        file_name=cache["filename"],
-        mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        data=docx,
+        file_name=filename,
     )
-    if cache.get("json_data") and st.button("Показать JSON после сканирования"):
+    if json_data and st.button("Показать JSON после сканирования"):
         st.subheader("JSON для заполнения договора")
-        st.json(cache["json_data"])
-    if cache.get("ocr_text"):
+        st.json(json_data)
+    if ocr_text:
         with st.expander("Распознанный текст (OCR)"):
-            st.text_area("Текст", cache["ocr_text"], height=240, disabled=True)
+            st.text_area("Текст", ocr_text, height=240, disabled=True)
 
-if st.button("Только распознать текст (без договора)"):
-    files = {
-        "file": (uploaded_file.name, uploaded_file.getvalue(), uploaded_file.type)
-    }
-    try:
-        with st.spinner("Распознаю текст..."):
-            response = requests.post(OCR_API_URL, files=files, timeout=60)
-        if response.status_code == 200:
-            data = response.json()
-            st.subheader("Результат OCR")
-            st.text_area("Текст", data.get("text", ""), height=300)
-        else:
-            show_api_error(response)
-    except requests.exceptions.ConnectionError:
-        st.error("Не удалось подключиться к FastAPI.")
-    except requests.exceptions.Timeout:
-        st.error("Сервер отвечает слишком долго.")
-    except Exception as e:
-        st.error(f"Ошибка: {e}")

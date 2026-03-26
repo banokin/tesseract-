@@ -4,15 +4,11 @@ import uuid
 from pathlib import Path
 
 from docxtpl import DocxTemplate
-from fastapi import APIRouter, File, UploadFile
+from fastapi import APIRouter, File, HTTPException, UploadFile
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, ConfigDict, Field
 
-from exceptions import (
-    file_not_found_exception,
-    template_not_found_exception,
-)
-from ocr import img_ocr, validate_upload
+from ocr import extract_text_from_upload
 
 router = APIRouter(tags=["dogovor"])
 
@@ -27,7 +23,7 @@ _DOWNLOAD_NAME = re.compile(r"^dogovor_[0-9a-f]{32}\.docx$")
 class ContractData(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
-    contract_city: str = "Москва"
+    contract_city: str = ""
     contract_number: str = ""
     contract_date: str = ""
     executor_name: str = ""
@@ -70,21 +66,30 @@ def _find(pattern: str, text: str, default: str = "") -> str:
     return match.group(1).strip() if match else default
 
 
-def _executor_section(text: str) -> str:
-    """Текст до блока «Заказчик» — реквизиты исполнителя без смешения с заказчиком."""
-    m = re.search(r"(?im)^\s*заказчик\b", text)
-    return text[: m.start()] if m else text
+def _section_text(text: str, header: str) -> str:
+    """
+    Возвращает текст секции по заголовку независимо от порядка блоков.
+    Секция идет от заголовка до ближайшего другого известного заголовка.
+    """
+    headers = ("исполнитель", "заказчик", "паспорт", "объект")
+    start_match = re.search(rf"(?im)^\s*{header}(?:\s+\w+)?\s*:?\s*$", text)
+    if not start_match:
+        return ""
 
-
-def _customer_section(text: str) -> str:
-    """Текст начиная с блока «Заказчик»."""
-    m = re.search(r"(?im)^\s*заказчик\b", text)
-    return text[m.start() :] if m else text
+    start = start_match.end()
+    end = len(text)
+    for candidate in headers:
+        if candidate == header:
+            continue
+        m = re.search(rf"(?im)^\s*{candidate}(?:\s+\w+)?\s*:?\s*$", text[start:])
+        if m:
+            end = min(end, start + m.start())
+    return text[start:end]
 
 
 def extract_fields(text: str) -> dict:
-    exec_text = _executor_section(text)
-    cust_text = _customer_section(text)
+    exec_text = _section_text(text, "исполнитель")
+    cust_text = _section_text(text, "заказчик")
 
     fields = {
         # город договора (без захвата следующей строки «ДОГОВОР …»)
@@ -187,7 +192,7 @@ def build_payload_from_ocr_text(ocr_text: str) -> ContractPayload:
 
 def create_doc(contract_data: ContractData, output_path: Path) -> None:
     if not TEMPLATE_PATH.exists():
-        raise template_not_found_exception()
+        raise HTTPException(status_code=500, detail="Файл шаблона договора не найден")
 
     doc = DocxTemplate(str(TEMPLATE_PATH))
     doc.render(contract_data.model_dump())
@@ -197,16 +202,13 @@ def create_doc(contract_data: ContractData, output_path: Path) -> None:
 def _resolve_download_path(filename: str) -> Path:
     safe_name = Path(filename).name
     if not _DOWNLOAD_NAME.fullmatch(safe_name):
-        raise file_not_found_exception()
+        raise HTTPException(status_code=404, detail="Файл не найден")
     return OUTPUT_DIR / safe_name
 
 
 @router.post("/ocr-to-contract")
 async def ocr_to_contract(file: UploadFile = File(...)):
-    contents = await file.read()
-    validate_upload(file, contents)
-
-    text = await asyncio.to_thread(img_ocr, contents)
+    text = await extract_text_from_upload(file)
     payload = await asyncio.to_thread(build_payload_from_ocr_text, text)
 
     output_name = f"dogovor_{uuid.uuid4().hex}.docx"
@@ -226,7 +228,7 @@ async def ocr_to_contract(file: UploadFile = File(...)):
 async def download_file(filename: str):
     file_path = _resolve_download_path(filename)
     if not file_path.exists():
-        raise file_not_found_exception()
+        raise HTTPException(status_code=404, detail="Файл не найден")
     return FileResponse(
         path=file_path,
         filename=file_path.name,
