@@ -11,6 +11,8 @@ from typing import Any, Dict, List
 
 from fastapi import APIRouter, File, HTTPException, UploadFile
 from huggingface_hub import InferenceClient
+from huggingface_hub.errors import InferenceTimeoutError
+from requests.exceptions import Timeout as RequestsTimeout
 from PIL import Image, UnidentifiedImageError
 from pydantic import BaseModel
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -23,7 +25,7 @@ class Settings(BaseSettings):
     hf_token: str
     hf_model: str = "Qwen/Qwen2.5-VL-7B-Instruct"
     max_file_size_mb: int = 10
-    hf_request_timeout_sec: int = 60
+    hf_request_timeout_sec: int = 90
 
 
 settings = Settings()
@@ -59,7 +61,10 @@ class PassportScanTesseractResponse(BaseModel):
     text: str
 
 
-client = InferenceClient(api_key=settings.hf_token)
+client = InferenceClient(
+    api_key=settings.hf_token,
+    timeout=float(settings.hf_request_timeout_sec),
+)
 
 
 def validate_image(contents: bytes) -> None:
@@ -98,44 +103,42 @@ def image_to_data_url(contents: bytes, mime: str) -> str:
     return f"data:{mime};base64,{encoded}"
 
 
-def extract_json_from_text(text: str) -> Dict[str, Any]:
-    text = text.strip()
+def _first_balanced_json_object(text: str) -> str | None:
+    """
+    Находит первый объект `{...}` с корректной балансировкой скобок,
+    учитывая строки в двойных кавычках (экранирование \\").
+    Не обрабатывает одинарные кавычки внутри JSON — для плоского паспорта достаточно.
+    """
+    start = text.find("{")
+    if start < 0:
+        return None
+    depth = 0
+    in_string = False
+    escape = False
+    for i in range(start, len(text)):
+        c = text[i]
+        if in_string:
+            if escape:
+                escape = False
+            elif c == "\\":
+                escape = True
+            elif c == '"':
+                in_string = False
+            continue
+        if c == '"':
+            in_string = True
+            continue
+        if c == "{":
+            depth += 1
+        elif c == "}":
+            depth -= 1
+            if depth == 0:
+                return text[start : i + 1]
+    return None
 
-    try:
-        return json.loads(text)
-    except Exception:
-        pass
 
-    fenced = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", text, flags=re.DOTALL)
-    if fenced:
-        candidate = fenced.group(1).strip()
-        try:
-            return json.loads(candidate)
-        except Exception:
-            text = candidate
-
-    plain = re.search(r"(\{.*\})", text, flags=re.DOTALL)
-    if not plain:
-        raise ValueError("Не удалось извлечь JSON из ответа модели")
-    candidate = plain.group(1).strip()
-
-    candidate = candidate.replace("“", '"').replace("”", '"').replace("’", "'")
-    candidate = re.sub(r",(\s*[}\]])", r"\1", candidate)
-
-    try:
-        return json.loads(candidate)
-    except Exception:
-        pass
-
-    # fallback: иногда модель возвращает python-dict-подобный текст
-    try:
-        parsed = ast.literal_eval(candidate)
-        if isinstance(parsed, dict):
-            return parsed
-    except Exception:
-        pass
-
-    # fallback: вытащить нужные ключи из "грязного" ответа
+def _extract_passport_keys_loose(text: str) -> Dict[str, Any]:
+    """Последний шанс: значения строковых полей до запятой или } (без вложенных кавычек в значении)."""
     keys = [
         "issuing_authority",
         "issue_date",
@@ -152,12 +155,73 @@ def extract_json_from_text(text: str) -> Dict[str, Any]:
     ]
     extracted: Dict[str, Any] = {}
     for key in keys:
-        m = re.search(rf'["\']{key}["\']\s*:\s*["\'](.*?)["\']', candidate, flags=re.DOTALL)
+        m = re.search(
+            rf'["\']{re.escape(key)}["\']\s*:\s*'
+            r'(?:"([^"]*)"|\'([^\']*)\'|(\d+))',
+            text,
+            flags=re.DOTALL,
+        )
         if m:
-            extracted[key] = m.group(1).strip()
+            val = (m.group(1) or m.group(2) or m.group(3) or "").strip()
+            extracted[key] = val
+    return extracted
 
-    if extracted:
-        return extracted
+
+def _passport_loose_usable(d: Dict[str, Any]) -> bool:
+    if len(d) < 2:
+        return False
+    if len(d) >= 4:
+        return True
+    return any(
+        d.get(k)
+        for k in ("surname", "name", "passport_number", "issuing_authority", "passport_series")
+    )
+
+
+def extract_json_from_text(text: str) -> Dict[str, Any]:
+    text = text.strip()
+
+    try:
+        return json.loads(text)
+    except Exception:
+        pass
+
+    fence = re.search(r"```(?:json)?\s*", text, flags=re.DOTALL | re.IGNORECASE)
+    if fence:
+        rest = text[fence.end() :]
+        closing = rest.find("```")
+        block = rest[:closing] if closing >= 0 else rest
+        fb = _first_balanced_json_object(block)
+        if fb:
+            try:
+                return json.loads(fb.strip())
+            except Exception:
+                text = fb.strip()
+        else:
+            text = block.strip()
+
+    balanced = _first_balanced_json_object(text)
+    if balanced:
+        candidate = balanced.strip()
+        candidate = candidate.replace("“", '"').replace("”", '"').replace("’", "'")
+        candidate = re.sub(r",(\s*[}\]])", r"\1", candidate)
+        try:
+            return json.loads(candidate)
+        except Exception:
+            pass
+        try:
+            parsed = ast.literal_eval(candidate)
+            if isinstance(parsed, dict):
+                return parsed
+        except Exception:
+            pass
+        loose = _extract_passport_keys_loose(candidate)
+        if _passport_loose_usable(loose):
+            return loose
+
+    loose = _extract_passport_keys_loose(text)
+    if _passport_loose_usable(loose):
+        return loose
 
     raise ValueError("Не удалось извлечь JSON из ответа модели")
 
@@ -242,33 +306,50 @@ async def run_hf_passport_extraction(contents: bytes) -> str:
     image_url = image_to_data_url(contents, mime)
     prompt = build_prompt()
 
+    # Жёсткий предел: если HTTP-клиент HF не вернёт управление, поток не должен висеть вечно.
+    hard_timeout_sec = float(settings.hf_request_timeout_sec) + 45.0
+
+    def _sync_chat_completion():
+        return client.chat_completion(
+            model=settings.hf_model,
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "image_url", "image_url": {"url": image_url}},
+                        {"type": "text", "text": prompt},
+                    ],
+                }
+            ],
+            max_tokens=700,
+            temperature=0,
+        )
+
     last_error: Exception | None = None
     for attempt in range(3):
         try:
-            # network call is blocking -> run in thread
             completion = await asyncio.wait_for(
-                asyncio.to_thread(
-                    client.chat_completion,
-                    model=settings.hf_model,
-                    messages=[
-                        {
-                            "role": "user",
-                            "content": [
-                                {"type": "image_url", "image_url": {"url": image_url}},
-                                {"type": "text", "text": prompt},
-                            ],
-                        }
-                    ],
-                    max_tokens=700,
-                    temperature=0,
-                ),
-                timeout=settings.hf_request_timeout_sec,
+                asyncio.to_thread(_sync_chat_completion),
+                timeout=hard_timeout_sec,
             )
             break
-        except asyncio.TimeoutError as e:
-            last_error = e
-            if attempt < 2:
-                await asyncio.sleep(1.5 * (attempt + 1))
+        except TimeoutError as e:
+            raise HTTPException(
+                status_code=504,
+                detail=(
+                    f"Превышено время ожидания ответа от Hugging Face (~{int(hard_timeout_sec)} с). "
+                    "Для скана паспорта нужна vision-модель (например Qwen/Qwen2.5-VL-7B-Instruct в HF_MODEL). "
+                    "Проверьте .env и HF_REQUEST_TIMEOUT_SEC."
+                ),
+            ) from e
+        except (InferenceTimeoutError, RequestsTimeout) as e:
+            raise HTTPException(
+                status_code=504,
+                detail=(
+                    f"Превышено время ожидания ответа от Hugging Face ({settings.hf_request_timeout_sec} с). "
+                    "Повторите позже, смените модель в .env (HF_MODEL) или увеличьте HF_REQUEST_TIMEOUT_SEC."
+                ),
+            ) from e
         except Exception as e:
             last_error = e
             if attempt < 2:
@@ -281,7 +362,7 @@ async def run_hf_passport_extraction(contents: bytes) -> str:
                 "Попробуйте повторить запрос через 10-30 секунд "
                 "или используйте режим Tesseract. "
                 f"Техническая ошибка: {last_error}. "
-                f"Таймаут одного запроса: {settings.hf_request_timeout_sec} сек."
+                f"Таймаут HTTP: {settings.hf_request_timeout_sec} сек."
             ),
         )
 
