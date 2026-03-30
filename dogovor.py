@@ -2,6 +2,7 @@ import asyncio
 import re
 import uuid
 from pathlib import Path
+from typing import Any, Mapping
 
 from docxtpl import DocxTemplate
 from fastapi import APIRouter, File, HTTPException, UploadFile
@@ -151,6 +152,59 @@ def extract_fields(text: str) -> dict:
     }
 
     return fields
+
+
+def _extract_passport_data_dict(payload: Mapping[str, Any]) -> dict[str, Any]:
+    """Достаёт объект полей паспорта из полного ответа API или из плоского dict."""
+    if not isinstance(payload, Mapping):
+        return {}
+    inner = payload.get("data")
+    if isinstance(inner, Mapping):
+        return dict(inner)
+    if any(
+        k in payload
+        for k in ("issuing_authority", "passport_series", "surname", "passport_number")
+    ):
+        return dict(payload)
+    return {}
+
+
+def passport_scan_to_contract_data(passport_payload: Mapping[str, Any]) -> ContractData:
+    """
+    Заполняет ContractData данными из JSON сканирования паспорта (HF и т.п.).
+
+    Ожидается либо полный ответ API: ``{"ok": true, "data": {...}}``,
+    либо только объект ``data`` с полями как у PassportData.
+
+    Поля договора/исполнителя/объекта, которых нет в паспорте, остаются пустыми
+    (как незаполненные строки в ``extract_fields``).
+    """
+    data = _extract_passport_data_dict(passport_payload)
+
+    surname = str(data.get("surname", "") or "").strip()
+    name = str(data.get("name", "") or "").strip()
+    patronymic = str(data.get("patronymic", "") or "").strip()
+    customer_fio = " ".join(p for p in (surname, name, patronymic) if p)
+
+    return ContractData(
+        customer_fio=customer_fio,
+        passport_series=str(data.get("passport_series", "") or ""),
+        passport_number=str(data.get("passport_number", "") or ""),
+        passport_issued_by=str(data.get("issuing_authority", "") or ""),
+        passport_issue_date=str(data.get("issue_date", "") or ""),
+        passport_code=str(data.get("department_code", "") or ""),
+        birth_place=str(data.get("birth_place", "") or ""),
+        birth_date=str(data.get("birth_date", "") or ""),
+    )
+
+
+def passport_scan_to_contract_fields_dict(passport_payload: Mapping[str, Any]) -> dict[str, str]:
+    """
+    Тот же набор ключей, что возвращает ``extract_fields`` (см. dogovor.py ~90–151),
+    но значения берутся из скана паспорта; остальное — пустые строки.
+    Удобно для ``st.json`` или слияния с полями из OCR текста договора.
+    """
+    return passport_scan_to_contract_data(passport_payload).model_dump()
 
 
 def parse_ocr_to_contract_data(text: str) -> ContractData:

@@ -2,6 +2,8 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from dogovor import router as dogovor_router
+from dogovor_new import router as dogovor_new_router
+from scan_passport_hf import router as passport_router
 
 app = FastAPI(
     title="Сканер для договоров",
@@ -22,3 +24,5 @@ def root():
 
 
 app.include_router(dogovor_router)
+app.include_router(dogovor_new_router)
+app.include_router(passport_router)

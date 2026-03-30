@@ -6,7 +6,6 @@ import streamlit as st
 st.set_page_config(page_title="OCR и договор", page_icon="📄")
 
 API_BASE_URL = "http://127.0.0.1:8000"
-OCR_API_URL = f"{API_BASE_URL}/ocr"
 OCR_TO_CONTRACT_API_URL = f"{API_BASE_URL}/ocr-to-contract"
 MAX_FILE_SIZE_BYTES = 1024 * 1024 * 1024  # 1 GB
 
