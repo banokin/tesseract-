@@ -14,7 +14,7 @@ from huggingface_hub import InferenceClient
 from huggingface_hub.errors import InferenceTimeoutError
 from requests.exceptions import Timeout as RequestsTimeout
 from PIL import Image, UnidentifiedImageError
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from ocr import extract_text_from_upload
 
@@ -22,10 +22,10 @@ from ocr import extract_text_from_upload
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 
-    hf_token: str
-    hf_model: str = "Qwen/Qwen2.5-VL-7B-Instruct"
-    max_file_size_mb: int = 10
-    hf_request_timeout_sec: int = 90
+    hf_token: str = Field(validation_alias="HF_TOKEN")
+    hf_model: str = Field(default="Qwen/Qwen2.5-VL-7B-Instruct", validation_alias="HF_MODEL")
+    max_file_size_mb: int = Field(default=10, validation_alias="MAX_FILE_SIZE_MB")
+    hf_request_timeout_sec: int = Field(default=90, validation_alias="HF_REQUEST_TIMEOUT_SEC")
 
 
 settings = Settings()
