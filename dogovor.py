@@ -1,4 +1,3 @@
-import asyncio
 import re
 import uuid
 from pathlib import Path
@@ -9,6 +8,7 @@ from fastapi import APIRouter, File, HTTPException, UploadFile
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, ConfigDict, Field
 
+from async_utils import safe_to_thread
 from ocr import extract_text_from_upload
 
 router = APIRouter(tags=["dogovor"])
@@ -238,11 +238,11 @@ def _resolve_download_path(filename: str) -> Path:
 @router.post("/ocr-to-contract")
 async def ocr_to_contract(file: UploadFile = File(...)):
     text = await extract_text_from_upload(file)
-    payload = await asyncio.to_thread(build_payload_from_ocr_text, text)
+    payload = await safe_to_thread(build_payload_from_ocr_text, text)
 
     output_name = f"dogovor_{uuid.uuid4().hex}.docx"
     output_path = OUTPUT_DIR / output_name
-    await asyncio.to_thread(create_doc, payload.contract_data, output_path)
+    await safe_to_thread(create_doc, payload.contract_data, output_path)
 
     return {
         "message": "Договор успешно заполнен",

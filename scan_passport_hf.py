@@ -5,17 +5,17 @@ import base64
 import ast
 import imghdr
 import json
+import logging
 import re
 from io import BytesIO
 from typing import Any, Dict, List
 
 from fastapi import APIRouter, File, HTTPException, UploadFile
-from huggingface_hub import InferenceClient
-from huggingface_hub.errors import InferenceTimeoutError
-from requests.exceptions import Timeout as RequestsTimeout
+from openai import OpenAI, APITimeoutError
 from PIL import Image, UnidentifiedImageError
 from pydantic import BaseModel, Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
+from async_utils import safe_to_thread
 from ocr import extract_text_from_upload
 
 
@@ -23,12 +23,15 @@ class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 
     hf_token: str = Field(validation_alias="HF_TOKEN")
-    hf_model: str = Field(default="Qwen/Qwen2.5-VL-7B-Instruct", validation_alias="HF_MODEL")
+    hf_model: str = Field(default="Qwen/Qwen3-VL-8B-Instruct:novita", validation_alias="HF_MODEL")
+    hf_fallback_model: str = Field(default="", validation_alias="MODEL_2")
+    hf_base_url: str = Field(default="https://router.huggingface.co/v1", validation_alias="HF_BASE_URL")
     max_file_size_mb: int = Field(default=10, validation_alias="MAX_FILE_SIZE_MB")
     hf_request_timeout_sec: int = Field(default=90, validation_alias="HF_REQUEST_TIMEOUT_SEC")
 
 
 settings = Settings()
+logger = logging.getLogger(__name__)
 
 router = APIRouter(tags=["passport"])
 
@@ -61,7 +64,8 @@ class PassportScanTesseractResponse(BaseModel):
     text: str
 
 
-client = InferenceClient(
+client = OpenAI(
+    base_url=settings.hf_base_url,
     api_key=settings.hf_token,
     timeout=float(settings.hf_request_timeout_sec),
 )
@@ -178,8 +182,110 @@ def _passport_loose_usable(d: Dict[str, Any]) -> bool:
     )
 
 
+def _normalize_jsonish_text(text: str) -> str:
+    """
+    Нормализует "почти JSON" ответы модели:
+    - снимает внешние обертки вида (...) или "...";
+    - разворачивает экранирование \\n и \\" для строковых payload-ов;
+    - при необходимости добавляет фигурные скобки вокруг key:value списка.
+    """
+    s = text.strip()
+    if not s:
+        return s
+
+    # Иногда upstream возвращает repr-кортежа: ('{...}', 'model-id')
+    if s.startswith("(") and s.endswith(")"):
+        try:
+            parsed = ast.literal_eval(s)
+            if isinstance(parsed, tuple) and parsed:
+                first = parsed[0]
+                if isinstance(first, str) and first.strip():
+                    s = first.strip()
+        except Exception:
+            pass
+        # Fallback для строк вида ("{\\n ... }", "model"), которые не парсятся literal_eval.
+        if s.startswith("(") and s.endswith(")"):
+            m = re.search(r'^\(\s*"((?:\\.|[^"\\])*)"\s*,', s, flags=re.DOTALL)
+            if m:
+                inner = m.group(1)
+                s = inner.replace('\\"', '"').replace("\\n", "\n").strip()
+
+    # Иногда модель возвращает JSON в скобках: ( {...} ) или ("k":"v", ...)
+    if len(s) >= 2 and s[0] == "(" and s[-1] == ")":
+        s = s[1:-1].strip()
+
+    # Если весь payload пришел как одна экранированная строка, снимем внешние кавычки
+    # и разэкранируем минимально необходимое для JSON-парсинга.
+    if len(s) >= 2 and s[0] == '"' and s[-1] == '"':
+        s = s[1:-1]
+        s = s.replace('\\"', '"').replace("\\n", "\n")
+
+    # Если пришел список полей без {}, завернем в объект.
+    if "{" not in s and "}" not in s and re.search(r'["\']\w+["\']\s*:', s):
+        s = "{%s}" % s
+
+    return s.strip()
+
+
+def _repair_passport_jsonish(text: str) -> Dict[str, Any]:
+    """
+    Восстанавливает паспортные поля из "битого JSON"-текста:
+    - ищет ключи из фиксированного белого списка;
+    - корректно режет значение до следующего ключа;
+    - убирает кавычки/мусорные разделители и хвостовые запятые.
+    """
+    keys = [
+        "issuing_authority",
+        "issue_date",
+        "department_code",
+        "passport_series",
+        "passport_number",
+        "surname",
+        "name",
+        "patronymic",
+        "gender",
+        "birth_date",
+        "birth_place",
+        "confidence_note",
+    ]
+    key_group = "|".join(re.escape(k) for k in keys)
+    # Ищем "key": или 'key':
+    key_re = re.compile(rf'["\']({key_group})["\']\s*:\s*', flags=re.DOTALL)
+    matches = list(key_re.finditer(text))
+    if not matches:
+        return {}
+
+    result: Dict[str, Any] = {}
+    for idx, m in enumerate(matches):
+        key = m.group(1)
+        value_start = m.end()
+        value_end = matches[idx + 1].start() if idx + 1 < len(matches) else len(text)
+        raw_val = text[value_start:value_end].strip()
+
+        # Срезаем типичные хвосты между полями
+        raw_val = raw_val.lstrip(",")
+        raw_val = raw_val.rstrip(",")
+        raw_val = raw_val.strip()
+
+        # Убираем обёртки, если значение пришло в кавычках
+        if len(raw_val) >= 2 and (
+            (raw_val[0] == '"' and raw_val[-1] == '"')
+            or (raw_val[0] == "'" and raw_val[-1] == "'")
+        ):
+            raw_val = raw_val[1:-1]
+
+        # Нормализуем экранирование
+        raw_val = raw_val.replace('\\"', '"').replace("\\n", "\n").strip()
+
+        # Если в конце случайно остался символ закрытия объекта/скобки
+        raw_val = re.sub(r"[}\])]+$", "", raw_val).strip()
+        result[key] = raw_val
+
+    return result
+
+
 def extract_json_from_text(text: str) -> Dict[str, Any]:
-    text = text.strip()
+    text = _normalize_jsonish_text(text)
 
     try:
         return json.loads(text)
@@ -220,6 +326,14 @@ def extract_json_from_text(text: str) -> Dict[str, Any]:
             return loose
 
     loose = _extract_passport_keys_loose(text)
+    if not _passport_loose_usable(loose):
+        # Второй проход для ответов с экранированными кавычками/переносами.
+        unescaped = text.replace('\\"', '"').replace("\\n", "\n")
+        loose = _extract_passport_keys_loose(unescaped)
+    if not _passport_loose_usable(loose):
+        repaired = _repair_passport_jsonish(text)
+        if _passport_loose_usable(repaired):
+            return repaired
     if _passport_loose_usable(loose):
         return loose
 
@@ -249,6 +363,12 @@ def _message_content_to_str(content: Any) -> str:
         return ""
     if isinstance(content, str):
         return content.strip()
+    if isinstance(content, tuple):
+        # В некоторых интеграциях может прийти (text, model/provider meta)
+        if len(content) >= 1 and isinstance(content[0], str):
+            return content[0].strip()
+        parts = [str(item) for item in content if item is not None]
+        return "\n".join(parts).strip()
     if isinstance(content, list):
         parts: List[str] = []
         for item in content:
@@ -301,7 +421,7 @@ def build_prompt() -> str:
 """.strip()
 
 
-async def run_hf_passport_extraction(contents: bytes) -> str:
+async def run_hf_passport_extraction(contents: bytes) -> tuple[str, str]:
     mime = detect_mime(contents)
     image_url = image_to_data_url(contents, mime)
     prompt = build_prompt()
@@ -309,9 +429,9 @@ async def run_hf_passport_extraction(contents: bytes) -> str:
     # Жёсткий предел: если HTTP-клиент HF не вернёт управление, поток не должен висеть вечно.
     hard_timeout_sec = float(settings.hf_request_timeout_sec) + 45.0
 
-    def _sync_chat_completion():
-        return client.chat_completion(
-            model=settings.hf_model,
+    def _chat_completion_for_model(model_name: str):
+        return client.chat.completions.create(
+            model=model_name,
             messages=[
                 {
                     "role": "user",
@@ -325,11 +445,27 @@ async def run_hf_passport_extraction(contents: bytes) -> str:
             temperature=0,
         )
 
+    def _sync_chat_completion() -> tuple[Any, str]:
+        primary = settings.hf_model
+        fallback = settings.hf_fallback_model.strip()
+        try:
+            return _chat_completion_for_model(primary), primary
+        except Exception as e:
+            # На router-маршруте иногда модель/провайдер может быть недоступен.
+            if fallback and fallback != primary:
+                logger.warning(
+                    "HF router primary model failed, switching to fallback",
+                    extra={"primary_model": primary, "fallback_model": fallback},
+                )
+                return _chat_completion_for_model(fallback), fallback
+            raise e
+
     last_error: Exception | None = None
+    last_error_cause: BaseException | None = None
     for attempt in range(3):
         try:
-            completion = await asyncio.wait_for(
-                asyncio.to_thread(_sync_chat_completion),
+            completion, used_model = await asyncio.wait_for(
+                safe_to_thread(_sync_chat_completion),
                 timeout=hard_timeout_sec,
             )
             break
@@ -342,26 +478,41 @@ async def run_hf_passport_extraction(contents: bytes) -> str:
                     "Проверьте .env и HF_REQUEST_TIMEOUT_SEC."
                 ),
             ) from e
-        except (InferenceTimeoutError, RequestsTimeout) as e:
+        except APITimeoutError as e:
             raise HTTPException(
                 status_code=504,
                 detail=(
-                    f"Превышено время ожидания ответа от Hugging Face ({settings.hf_request_timeout_sec} с). "
+                    f"Превышено время ожидания ответа от Hugging Face Router ({settings.hf_request_timeout_sec} с). "
                     "Повторите позже, смените модель в .env (HF_MODEL) или увеличьте HF_REQUEST_TIMEOUT_SEC."
                 ),
             ) from e
         except Exception as e:
             last_error = e
+            last_error_cause = e.__cause__
+            logger.exception(
+                "HF passport extraction attempt failed",
+                extra={
+                    "attempt": attempt + 1,
+                    "model": settings.hf_model,
+                    "error_repr": repr(e),
+                    "cause_repr": repr(e.__cause__) if e.__cause__ else None,
+                },
+            )
             if attempt < 2:
                 await asyncio.sleep(1.5 * (attempt + 1))
     else:
+        tech_error = repr(last_error) if last_error else "unknown"
+        tech_cause = repr(last_error_cause) if last_error_cause else "unknown"
         raise HTTPException(
             status_code=502,
             detail=(
                 "Hugging Face временно недоступен. "
                 "Попробуйте повторить запрос через 10-30 секунд "
                 "или используйте режим Tesseract. "
-                f"Техническая ошибка: {last_error}. "
+                f"Техническая ошибка: {tech_error}. "
+                f"Причина: {tech_cause}. "
+                f"Модель: {settings.hf_model}. "
+                f"Fallback: {settings.hf_fallback_model or 'не задан'}. "
                 f"Таймаут HTTP: {settings.hf_request_timeout_sec} сек."
             ),
         )
@@ -371,7 +522,7 @@ async def run_hf_passport_extraction(contents: bytes) -> str:
         text = _message_content_to_str(raw)
         if not text:
             raise ValueError("empty content")
-        return text
+        return text, used_model
     except Exception:
         raise HTTPException(
             status_code=502,
@@ -387,23 +538,34 @@ async def scan_passport(file: UploadFile = File(...)) -> PassportScanResponse:
     contents = await file.read()
     validate_image(contents)
 
-    raw_text = await run_hf_passport_extraction(contents)
+    raw_text, model_used = await run_hf_passport_extraction(contents)
 
     try:
         parsed = extract_json_from_text(raw_text)
         passport_data = normalize_passport_data(parsed)
     except Exception as e:
-        raise HTTPException(
-            status_code=500,
-            detail=(
-                "Модель вернула ответ, из которого не удалось извлечь JSON. "
-                f"Фрагмент ответа: {raw_text[:1000]}"
-            ),
-        ) from e
+        # Last-resort: не падаем 500, если удалось достать поля эвристикой.
+        normalized = _normalize_jsonish_text(raw_text)
+        repaired = _repair_passport_jsonish(normalized)
+        if not _passport_loose_usable(repaired):
+            repaired = _extract_passport_keys_loose(normalized)
+        if _passport_loose_usable(repaired):
+            passport_data = normalize_passport_data(repaired)
+            note = (passport_data.confidence_note or "").strip()
+            fallback_note = "JSON восстановлен эвристически из ответа модели."
+            passport_data.confidence_note = f"{note} {fallback_note}".strip() if note else fallback_note
+        else:
+            raise HTTPException(
+                status_code=500,
+                detail=(
+                    "Модель вернула невалидный JSON и данные не удалось восстановить. "
+                    f"Фрагмент ответа: {raw_text[:1000]}"
+                ),
+            ) from e
 
     return PassportScanResponse(
         ok=True,
-        model=settings.hf_model,
+        model=model_used,
         data=passport_data,
         raw_text=raw_text,
     )

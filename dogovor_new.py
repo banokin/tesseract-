@@ -1,12 +1,12 @@
 from __future__ import annotations
 
-import asyncio
 import uuid
 from pathlib import Path
 from typing import Any, Mapping
 
 from fastapi import APIRouter, File, HTTPException, UploadFile
 
+from async_utils import safe_to_thread
 from dogovor import (
     ContractData,
     OUTPUT_DIR,
@@ -63,7 +63,7 @@ async def scan_passport_to_contract_hf(file: UploadFile = File(...)):
     contents = await file.read()
     validate_image(contents)
 
-    raw_text = await run_hf_passport_extraction(contents)
+    raw_text, model_used = await run_hf_passport_extraction(contents)
     try:
         parsed = extract_json_from_text(raw_text)
     except Exception as e:
@@ -75,7 +75,7 @@ async def scan_passport_to_contract_hf(file: UploadFile = File(...)):
     contract_data = passport_scan_to_contract_data({"data": parsed})
     output_name = f"dogovor_{uuid.uuid4().hex}.docx"
     output_path = OUTPUT_DIR / output_name
-    await asyncio.to_thread(create_doc, contract_data, output_path)
+    await safe_to_thread(create_doc, contract_data, output_path)
 
     return {
         "message": "Договор создан по данным паспорта (Hugging Face)",
@@ -84,7 +84,7 @@ async def scan_passport_to_contract_hf(file: UploadFile = File(...)):
         "download_url": f"/download/{output_name}",
         "json_data": {
             "source": "huggingface_passport",
-            "model": hf_settings.hf_model,
+            "model": model_used or hf_settings.hf_model,
             "passport_data": parsed,
             "contract_data": contract_data.model_dump(),
             "raw_text": raw_text,

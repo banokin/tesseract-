@@ -1,10 +1,10 @@
-import asyncio
 import io
 from pathlib import Path
 
 import pytesseract
 from fastapi import APIRouter, HTTPException, UploadFile
 from PIL import Image
+from async_utils import safe_to_thread
 
 router = APIRouter(tags=["ocr"])
 MAX_FILE_SIZE_BYTES = 1024 * 1024 * 1024  # 1 GB
@@ -37,8 +37,13 @@ def unsupported_ocr_document_exception() -> HTTPException:
 
 
 def img_ocr(contents: bytes) -> str:
-    image = Image.open(io.BytesIO(contents))
-    return pytesseract.image_to_string(image, lang="rus+eng")
+    try:
+        image = Image.open(io.BytesIO(contents))
+        return pytesseract.image_to_string(image, lang="rus+eng")
+    except StopIteration as e:
+        # Python 3.12 не позволяет прокидывать StopIteration в asyncio Future
+        # из asyncio.to_thread(...), поэтому нормализуем в обычное исключение.
+        raise RuntimeError("OCR engine failed while iterating image data") from e
 
 
 def validate_upload(file: UploadFile, contents: bytes) -> None:
@@ -58,4 +63,10 @@ def validate_upload(file: UploadFile, contents: bytes) -> None:
 async def extract_text_from_upload(file: UploadFile) -> str:
     contents = await file.read()
     validate_upload(file, contents)
-    return await asyncio.to_thread(img_ocr, contents)
+    try:
+        return await safe_to_thread(img_ocr, contents)
+    except RuntimeError as e:
+        raise HTTPException(
+            status_code=500,
+            detail="Ошибка OCR-движка при обработке изображения",
+        ) from e

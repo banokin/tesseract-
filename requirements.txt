@@ -10,6 +10,7 @@ charset-normalizer==3.4.6
 click==8.3.1
 fastapi==0.135.1
 huggingface_hub==0.36.2
+openai==2.29.0
 gitdb==4.0.12
 GitPython==3.1.46
 h11==0.16.0
