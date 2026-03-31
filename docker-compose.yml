@@ -1,0 +1,9 @@
+services:
+  api:
+    build: .
+    container_name: tesseract-fastapi
+    ports:
+      - "8000:8000"
+    env_file:
+      - .env
+    restart: unless-stopped

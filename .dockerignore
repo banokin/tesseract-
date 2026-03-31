@@ -1,0 +1,14 @@
+.git
+.gitignore
+venv
+.venv
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+.DS_Store
+.env
+generated_docs
+tests
+pages
+agent-transcripts
