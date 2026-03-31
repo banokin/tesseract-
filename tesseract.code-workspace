@@ -1,0 +1,11 @@
+{
+	"folders": [
+		{
+			"path": "."
+		},
+		{
+			"path": "../scanner-next-front/scanner-front-next"
+		}
+	],
+	"settings": {}
+}
