@@ -37,6 +37,7 @@ class ContractData(BaseModel):
     executor_rs: str = ""
     executor_ks: str = ""
     customer_fio: str = ""
+    customer_fio_short: str = ""
     customer_registration_address: str = ""
     customer_email: str = ""
     customer_phone: str = ""
@@ -64,6 +65,27 @@ class ContractPayload(BaseModel):
 def _find(pattern: str, text: str, default: str = "") -> str:
     match = re.search(pattern, text, re.IGNORECASE | re.MULTILINE)
     return match.group(1).strip() if match else default
+
+
+def normalize_person_fio(raw_fio: str) -> str:
+    value = str(raw_fio or "").strip()
+    if not value:
+        return ""
+    parts = [p for p in re.split(r"\s+", value) if p]
+    normalized: list[str] = []
+    for part in parts:
+        low = part.lower()
+        normalized.append(low[:1].upper() + low[1:])
+    return " ".join(normalized)
+
+
+def build_short_fio(full_fio: str) -> str:
+    parts = [p for p in re.split(r"\s+", str(full_fio or "").strip()) if p]
+    if not parts:
+        return ""
+    surname = parts[0]
+    initials = "".join(f"{p[0].upper()}." for p in parts[1:] if p)
+    return f"{surname} {initials}".strip()
 
 
 def _section_text(text: str, header: str) -> str:
@@ -184,10 +206,13 @@ def passport_scan_to_contract_data(passport_payload: Mapping[str, Any]) -> Contr
     surname = str(data.get("surname", "") or "").strip()
     name = str(data.get("name", "") or "").strip()
     patronymic = str(data.get("patronymic", "") or "").strip()
-    customer_fio = " ".join(p for p in (surname, name, patronymic) if p)
+    customer_fio_raw = " ".join(p for p in (surname, name, patronymic) if p)
+    customer_fio = normalize_person_fio(customer_fio_raw)
+    customer_fio_short = build_short_fio(customer_fio)
 
     return ContractData(
         customer_fio=customer_fio,
+        customer_fio_short=customer_fio_short,
         passport_series=str(data.get("passport_series", "") or ""),
         passport_number=str(data.get("passport_number", "") or ""),
         passport_issued_by=str(data.get("issuing_authority", "") or ""),

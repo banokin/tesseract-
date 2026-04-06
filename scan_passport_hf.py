@@ -64,6 +64,42 @@ class PassportScanTesseractResponse(BaseModel):
     text: str
 
 
+class PassportRegistrationData(BaseModel):
+    region: str = ""
+    city: str = ""
+    settlement: str = ""
+    street: str = ""
+    house: str = ""
+    building: str = ""
+    apartment: str = ""
+    registration_date: str = ""
+    confidence_note: str = ""
+
+
+class EgrnExtractData(BaseModel):
+    cadastral_number: str = ""
+    object_type: str = ""
+    address: str = ""
+    area_sq_m: str = ""
+    ownership_type: str = ""
+    right_holders: List[str] = Field(default_factory=list)
+    extract_date: str = ""
+    confidence_note: str = ""
+
+
+class UnifiedDocumentsData(BaseModel):
+    passport_main: PassportData
+    passport_registration: PassportRegistrationData
+    egrn_extract: EgrnExtractData
+
+
+class UnifiedDocumentsScanResponse(BaseModel):
+    ok: bool
+    model: str
+    data: UnifiedDocumentsData
+    raw_text: Dict[str, str]
+
+
 client = OpenAI(
     base_url=settings.hf_base_url,
     api_key=settings.hf_token,
@@ -357,6 +393,73 @@ def normalize_passport_data(payload: Dict[str, Any]) -> PassportData:
     )
 
 
+def normalize_registration_data(payload: Dict[str, Any]) -> PassportRegistrationData:
+    return PassportRegistrationData(
+        region=str(payload.get("region", "") or ""),
+        city=str(payload.get("city", "") or ""),
+        settlement=str(payload.get("settlement", "") or ""),
+        street=str(payload.get("street", "") or ""),
+        house=str(payload.get("house", "") or ""),
+        building=str(payload.get("building", "") or ""),
+        apartment=str(payload.get("apartment", "") or ""),
+        registration_date=str(payload.get("registration_date", "") or ""),
+        confidence_note=str(payload.get("confidence_note", "") or ""),
+    )
+
+
+def normalize_egrn_data(payload: Dict[str, Any]) -> EgrnExtractData:
+    raw_holders = payload.get("right_holders", [])
+    right_holders: List[str]
+    if isinstance(raw_holders, list):
+        right_holders = [str(item).strip() for item in raw_holders if str(item).strip()]
+    elif isinstance(raw_holders, str):
+        right_holders = [item.strip() for item in raw_holders.split(",") if item.strip()]
+    else:
+        right_holders = []
+
+    return EgrnExtractData(
+        cadastral_number=str(payload.get("cadastral_number", "") or ""),
+        object_type=str(payload.get("object_type", "") or ""),
+        address=str(payload.get("address", "") or ""),
+        area_sq_m=str(payload.get("area_sq_m", "") or ""),
+        ownership_type=str(payload.get("ownership_type", "") or ""),
+        right_holders=right_holders,
+        extract_date=str(payload.get("extract_date", "") or ""),
+        confidence_note=str(payload.get("confidence_note", "") or ""),
+    )
+
+
+def extract_generic_json_from_text(text: str) -> Dict[str, Any]:
+    normalized = _normalize_jsonish_text(text)
+
+    try:
+        parsed = json.loads(normalized)
+        if isinstance(parsed, dict):
+            return parsed
+    except Exception:
+        pass
+
+    balanced = _first_balanced_json_object(normalized)
+    if balanced:
+        candidate = balanced.strip()
+        candidate = candidate.replace("“", '"').replace("”", '"').replace("’", "'")
+        candidate = re.sub(r",(\s*[}\]])", r"\1", candidate)
+        try:
+            parsed = json.loads(candidate)
+            if isinstance(parsed, dict):
+                return parsed
+        except Exception:
+            pass
+        try:
+            parsed = ast.literal_eval(candidate)
+            if isinstance(parsed, dict):
+                return parsed
+        except Exception:
+            pass
+
+    raise ValueError("Не удалось извлечь JSON-объект из ответа модели")
+
+
 def _message_content_to_str(content: Any) -> str:
     """HF chat completion может вернуть content строкой или списком блоков (VLM)."""
     if content is None:
@@ -421,10 +524,67 @@ def build_prompt() -> str:
 """.strip()
 
 
-async def run_hf_passport_extraction(contents: bytes) -> tuple[str, str]:
+def build_registration_prompt() -> str:
+    return """
+Ты OCR/Document AI модуль.
+Извлеки данные ТОЛЬКО со страницы паспорта с регистрацией (пропиской).
+
+Верни ответ СТРОГО в JSON без markdown и без пояснений.
+Не добавляй текст до JSON и после JSON.
+
+Формат ответа:
+{
+  "region": "",
+  "city": "",
+  "settlement": "",
+  "street": "",
+  "house": "",
+  "building": "",
+  "apartment": "",
+  "registration_date": "",
+  "confidence_note": ""
+}
+
+Правила:
+- Если поля нет или не удалось уверенно прочитать — верни пустую строку.
+- Не выдумывай значения.
+- Дату регистрации приводи к формату DD.MM.YYYY, если это возможно.
+- confidence_note: коротко укажи, какие поля могли быть распознаны неуверенно.
+""".strip()
+
+
+def build_egrn_prompt() -> str:
+    return """
+Ты OCR/Document AI модуль.
+Извлеки данные ТОЛЬКО из выписки ЕГРН.
+
+Верни ответ СТРОГО в JSON без markdown и без пояснений.
+Не добавляй текст до JSON и после JSON.
+
+Формат ответа:
+{
+  "cadastral_number": "",
+  "object_type": "",
+  "address": "",
+  "area_sq_m": "",
+  "ownership_type": "",
+  "right_holders": [],
+  "extract_date": "",
+  "confidence_note": ""
+}
+
+Правила:
+- Если поля нет или не удалось уверенно прочитать — верни пустую строку.
+- Не выдумывай значения.
+- right_holders верни массивом строк.
+- extract_date приводи к формату DD.MM.YYYY, если это возможно.
+- confidence_note: коротко укажи, какие поля могли быть распознаны неуверенно.
+""".strip()
+
+
+async def run_hf_document_extraction(contents: bytes, prompt: str, max_tokens: int = 700) -> tuple[str, str]:
     mime = detect_mime(contents)
     image_url = image_to_data_url(contents, mime)
-    prompt = build_prompt()
 
     # Жёсткий предел: если HTTP-клиент HF не вернёт управление, поток не должен висеть вечно.
     hard_timeout_sec = float(settings.hf_request_timeout_sec) + 45.0
@@ -441,7 +601,7 @@ async def run_hf_passport_extraction(contents: bytes) -> tuple[str, str]:
                     ],
                 }
             ],
-            max_tokens=700,
+            max_tokens=max_tokens,
             temperature=0,
         )
 
@@ -530,6 +690,10 @@ async def run_hf_passport_extraction(contents: bytes) -> tuple[str, str]:
         )
 
 
+async def run_hf_passport_extraction(contents: bytes) -> tuple[str, str]:
+    return await run_hf_document_extraction(contents, build_prompt(), max_tokens=700)
+
+
 @router.post("/scan-passport", response_model=PassportScanResponse)
 async def scan_passport(file: UploadFile = File(...)) -> PassportScanResponse:
     if not file.content_type or not file.content_type.startswith("image/"):
@@ -568,6 +732,88 @@ async def scan_passport(file: UploadFile = File(...)) -> PassportScanResponse:
         model=model_used,
         data=passport_data,
         raw_text=raw_text,
+    )
+
+
+@router.post("/scan-documents-unified", response_model=UnifiedDocumentsScanResponse)
+async def scan_documents_unified(
+    passport_main: UploadFile = File(...),
+    passport_registration: UploadFile = File(...),
+    egrn_extract: UploadFile = File(...),
+) -> UnifiedDocumentsScanResponse:
+    uploads = {
+        "passport_main": passport_main,
+        "passport_registration": passport_registration,
+        "egrn_extract": egrn_extract,
+    }
+    for key, upload in uploads.items():
+        if not upload.content_type or not upload.content_type.startswith("image/"):
+            raise HTTPException(status_code=400, detail=f"{key}: загрузите изображение")
+
+    main_bytes = await passport_main.read()
+    registration_bytes = await passport_registration.read()
+    egrn_bytes = await egrn_extract.read()
+
+    validate_image(main_bytes)
+    validate_image(registration_bytes)
+    validate_image(egrn_bytes)
+
+    try:
+        passport_raw, model_used = await run_hf_passport_extraction(main_bytes)
+        registration_raw, _ = await run_hf_document_extraction(
+            registration_bytes,
+            build_registration_prompt(),
+            max_tokens=600,
+        )
+        egrn_raw, _ = await run_hf_document_extraction(
+            egrn_bytes,
+            build_egrn_prompt(),
+            max_tokens=700,
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Ошибка сканирования документов: {e!r}") from e
+
+    try:
+        passport_data = normalize_passport_data(extract_json_from_text(passport_raw))
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Не удалось разобрать JSON паспорта: {passport_raw[:1000]}",
+        ) from e
+
+    try:
+        registration_data = normalize_registration_data(
+            extract_generic_json_from_text(registration_raw)
+        )
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Не удалось разобрать JSON страницы регистрации: {registration_raw[:1000]}",
+        ) from e
+
+    try:
+        egrn_data = normalize_egrn_data(extract_generic_json_from_text(egrn_raw))
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Не удалось разобрать JSON выписки ЕГРН: {egrn_raw[:1000]}",
+        ) from e
+
+    return UnifiedDocumentsScanResponse(
+        ok=True,
+        model=model_used,
+        data=UnifiedDocumentsData(
+            passport_main=passport_data,
+            passport_registration=registration_data,
+            egrn_extract=egrn_data,
+        ),
+        raw_text={
+            "passport_main": passport_raw,
+            "passport_registration": registration_raw,
+            "egrn_extract": egrn_raw,
+        },
     )
 
 
