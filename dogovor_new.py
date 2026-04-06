@@ -97,7 +97,8 @@ def unified_json_to_contract_data(payload: Mapping[str, Any]) -> ContractData:
     customer_fio = normalize_person_fio(customer_fio_raw)
     customer_fio_short = build_short_fio(customer_fio)
 
-    registration_address = _build_registration_address(passport_registration)
+    override_address = str(payload.get("customer_registration_address_override", "") or "").strip()
+    registration_address = override_address or _build_registration_address(passport_registration)
     extract_date = str(egrn_extract.get("extract_date", "") or "").strip()
     ownership_basis = f"Выписка ЕГРН от {extract_date}" if extract_date else "Выписка ЕГРН"
 
