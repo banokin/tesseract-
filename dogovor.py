@@ -14,7 +14,10 @@ from ocr import extract_text_from_upload
 router = APIRouter(tags=["dogovor"])
 
 BASE_DIR = Path(__file__).resolve().parent
-TEMPLATE_PATH = BASE_DIR / "шаблон договора.docx"
+TEMPLATE_CANDIDATES = (
+    BASE_DIR / "шаблон договора (1) (1).docx",
+    BASE_DIR / "шаблон договора.docx",
+)
 OUTPUT_DIR = BASE_DIR / "generated_docs"
 OUTPUT_DIR.mkdir(exist_ok=True)
 _DOWNLOAD_NAME = re.compile(r"^dogovor_[0-9a-f]{32}\.docx$")
@@ -245,10 +248,11 @@ def build_payload_from_ocr_text(ocr_text: str) -> ContractPayload:
 
 
 def create_doc(contract_data: ContractData, output_path: Path) -> None:
-    if not TEMPLATE_PATH.exists():
+    template_path = next((p for p in TEMPLATE_CANDIDATES if p.exists()), None)
+    if template_path is None:
         raise HTTPException(status_code=500, detail="Файл шаблона договора не найден")
 
-    doc = DocxTemplate(str(TEMPLATE_PATH))
+    doc = DocxTemplate(str(template_path))
     doc.render(contract_data.model_dump())
     doc.save(str(output_path))
 

@@ -99,14 +99,17 @@ def unified_json_to_contract_data(payload: Mapping[str, Any]) -> ContractData:
 
     override_address = str(payload.get("customer_registration_address_override", "") or "").strip()
     registration_address = override_address or _build_registration_address(passport_registration)
-    extract_date = str(egrn_extract.get("extract_date", "") or "").strip()
-    ownership_basis = f"Выписка ЕГРН от {extract_date}" if extract_date else "Выписка ЕГРН"
+    ownership_basis = str(payload.get("ownership_basis_document_override", "") or "").strip()
+    customer_email = str(payload.get("customer_email_override", "") or "").strip()
+    customer_phone = str(payload.get("customer_phone_override", "") or "").strip()
 
     return ContractData(
-        contract_city=str(passport_registration.get("city", "") or "").strip(),
+        contract_city="",
         customer_fio=customer_fio,
         customer_fio_short=customer_fio_short,
         customer_registration_address=registration_address,
+        customer_email=customer_email,
+        customer_phone=customer_phone,
         passport_series=str(passport_main.get("passport_series", "") or "").strip(),
         passport_number=str(passport_main.get("passport_number", "") or "").strip(),
         passport_issued_by=str(passport_main.get("issuing_authority", "") or "").strip(),
