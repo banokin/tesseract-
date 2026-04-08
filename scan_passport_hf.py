@@ -18,6 +18,11 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 from async_utils import safe_to_thread
 from ocr import extract_text_from_upload
 
+try:
+    import fitz  # PyMuPDF
+except Exception:
+    fitz = None
+
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
@@ -107,7 +112,7 @@ client = OpenAI(
 )
 
 
-def validate_image(contents: bytes) -> None:
+def validate_file_size(contents: bytes) -> None:
     size_mb = len(contents) / (1024 * 1024)
     if size_mb > settings.max_file_size_mb:
         raise HTTPException(
@@ -115,6 +120,9 @@ def validate_image(contents: bytes) -> None:
             detail=f"Файл слишком большой. Максимум: {settings.max_file_size_mb} MB",
         )
 
+
+def validate_image(contents: bytes) -> None:
+    validate_file_size(contents)
     try:
         Image.open(BytesIO(contents)).verify()
     except (UnidentifiedImageError, OSError):
@@ -141,6 +149,28 @@ def detect_mime(contents: bytes) -> str:
 def image_to_data_url(contents: bytes, mime: str) -> str:
     encoded = base64.b64encode(contents).decode("utf-8")
     return f"data:{mime};base64,{encoded}"
+
+
+def pdf_first_page_to_png(pdf_bytes: bytes) -> bytes:
+    validate_file_size(pdf_bytes)
+    if fitz is None:
+        raise HTTPException(
+            status_code=500,
+            detail="Поддержка PDF не установлена на сервере (нужен PyMuPDF).",
+        )
+    try:
+        doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+        if doc.page_count < 1:
+            raise HTTPException(status_code=400, detail="PDF-файл не содержит страниц")
+        page = doc.load_page(0)
+        pix = page.get_pixmap(matrix=fitz.Matrix(2, 2), alpha=False)
+        png_bytes = pix.tobytes("png")
+        validate_image(png_bytes)
+        return png_bytes
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Не удалось обработать PDF: {e!r}") from e
 
 
 def _first_balanced_json_object(text: str) -> str | None:
@@ -741,14 +771,16 @@ async def scan_documents_unified(
     passport_registration: UploadFile = File(...),
     egrn_extract: UploadFile = File(...),
 ) -> UnifiedDocumentsScanResponse:
-    uploads = {
-        "passport_main": passport_main,
-        "passport_registration": passport_registration,
-        "egrn_extract": egrn_extract,
-    }
-    for key, upload in uploads.items():
-        if not upload.content_type or not upload.content_type.startswith("image/"):
-            raise HTTPException(status_code=400, detail=f"{key}: загрузите изображение")
+    if not passport_main.content_type or not passport_main.content_type.startswith("image/"):
+        raise HTTPException(status_code=400, detail="passport_main: загрузите изображение")
+    if not passport_registration.content_type or not passport_registration.content_type.startswith("image/"):
+        raise HTTPException(status_code=400, detail="passport_registration: загрузите изображение")
+    egrn_type = (egrn_extract.content_type or "").lower()
+    if not (egrn_type.startswith("image/") or egrn_type == "application/pdf"):
+        raise HTTPException(
+            status_code=400,
+            detail="egrn_extract: поддерживаются изображение или PDF",
+        )
 
     main_bytes = await passport_main.read()
     registration_bytes = await passport_registration.read()
@@ -756,7 +788,11 @@ async def scan_documents_unified(
 
     validate_image(main_bytes)
     validate_image(registration_bytes)
-    validate_image(egrn_bytes)
+    if egrn_type == "application/pdf":
+        egrn_ocr_bytes = pdf_first_page_to_png(egrn_bytes)
+    else:
+        validate_image(egrn_bytes)
+        egrn_ocr_bytes = egrn_bytes
 
     try:
         passport_raw, model_used = await run_hf_passport_extraction(main_bytes)
@@ -766,7 +802,7 @@ async def scan_documents_unified(
             max_tokens=600,
         )
         egrn_raw, _ = await run_hf_document_extraction(
-            egrn_bytes,
+            egrn_ocr_bytes,
             build_egrn_prompt(),
             max_tokens=700,
         )
