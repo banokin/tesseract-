@@ -28,9 +28,9 @@ class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 
     hf_token: str = Field(validation_alias="HF_TOKEN")
-    # Для скана документов нужна vision-модель (VL). Текстовые Qwen3.5-* дают пустой content на image_url.
+    # Для скана документов нужна мультимодальная модель (image+text). Чисто текстовые модели дают пустой content на image_url.
     hf_model: str = Field(
-        default="Qwen/Qwen3-VL-30B-A3B-Instruct:novita",
+        default="meta-llama/Llama-4-Scout-17B-16E-Instruct:novita",
         validation_alias="HF_MODEL",
     )
     hf_fallback_model: str = Field(default="", validation_alias="MODEL_2")
@@ -487,6 +487,32 @@ def _maybe_swap_name_and_patronymic(name: str, patronymic: str) -> tuple[str, st
     return n, p
 
 
+def _normalize_passport_series_number(series_raw: str, number_raw: str) -> tuple[str, str]:
+    """Паспорт РФ: ровно 10 цифр — первые 4 серия, последние 6 номер (часто печатают как 4518 478497)."""
+
+    def _d(value: str) -> str:
+        return re.sub(r"\D+", "", str(value or ""))
+
+    s, n = _d(series_raw), _d(number_raw)
+
+    if len(s) == 10 and not n:
+        return s[:4], s[4:10]
+    if len(n) == 10 and not s:
+        return n[:4], n[4:10]
+
+    combined = s + n
+    if len(combined) == 10:
+        return combined[:4], combined[4:10]
+    if len(combined) > 10:
+        combined = combined[:10]
+        return combined[:4], combined[4:10]
+
+    if len(s) == 4 and len(n) == 6:
+        return s, n
+
+    return s[:4], n[:6]
+
+
 def normalize_passport_data(payload: Dict[str, Any]) -> PassportData:
     def _normalize_date(value: str) -> str:
         s = str(value or "").strip()
@@ -513,12 +539,17 @@ def normalize_passport_data(payload: Dict[str, Any]) -> PassportData:
     raw_patronymic = str(payload.get("patronymic", "") or "")
     name, patronymic = _maybe_swap_name_and_patronymic(raw_name, raw_patronymic)
 
+    series_num = _normalize_passport_series_number(
+        str(payload.get("passport_series", "") or ""),
+        str(payload.get("passport_number", "") or ""),
+    )
+
     return PassportData(
         issuing_authority=str(payload.get("issuing_authority", "") or ""),
         issue_date=_normalize_date(str(payload.get("issue_date", "") or "")),
         department_code=department_code,
-        passport_series=_digits_only(str(payload.get("passport_series", "") or ""))[:4],
-        passport_number=_digits_only(str(payload.get("passport_number", "") or ""))[:6],
+        passport_series=series_num[0],
+        passport_number=series_num[1],
         surname=str(payload.get("surname", "") or ""),
         name=name,
         patronymic=patronymic,
@@ -749,7 +780,8 @@ def build_prompt() -> str:
 - Если поля нет или не удалось уверенно прочитать — верни пустую строку.
 - Не выдумывай значения.
 - Даты приводи к формату DD.MM.YYYY, если это возможно.
-- passport_series и passport_number верни отдельно, если это возможно.
+- Серия и номер паспорта РФ: всего 10 цифр подряд — первые 4 цифры это passport_series, последние 6 — passport_number.
+  На бланке часто две группы «4518» и «478497» или «45 18» и «478497»; всё равно разбей строго: series = 4 цифры, number = 6 цифр, без пробелов внутри значения.
 - ФИО (критично): на развороте РФ обычно три отдельных поля/строки — фамилия, имя, отчество сверху вниз или слева направо.
   - surname — только фамилия.
   - name — только личное имя (например Вячеслав, Мария), не отчество.
@@ -1048,7 +1080,7 @@ async def run_hf_document_extraction(contents: bytes, prompt: str, max_tokens: i
                 status_code=504,
                 detail=(
                     f"Превышено время ожидания ответа от Hugging Face (~{int(hard_timeout_sec)} с). "
-                    "Для скана паспорта нужна vision-модель (например Qwen/Qwen3-VL-30B-A3B-Instruct:novita в HF_MODEL). "
+                    "Для скана паспорта нужна мультимодальная модель (например meta-llama/Llama-4-Scout-17B-16E-Instruct:novita в HF_MODEL). "
                     "Проверьте .env и HF_REQUEST_TIMEOUT_SEC."
                 ),
             ) from e
