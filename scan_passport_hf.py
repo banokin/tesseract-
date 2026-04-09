@@ -11,9 +11,9 @@ from io import BytesIO
 from typing import Any, Dict, List
 
 from fastapi import APIRouter, File, HTTPException, UploadFile
-from openai import OpenAI, APITimeoutError
+from huggingface_hub import InferenceClient
 from PIL import Image, UnidentifiedImageError
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from async_utils import safe_to_thread
 from ocr import extract_text_from_upload
@@ -28,14 +28,56 @@ class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 
     hf_token: str = Field(validation_alias="HF_TOKEN")
-    hf_model: str = Field(default="Qwen/Qwen3-VL-8B-Instruct:novita", validation_alias="HF_MODEL")
+    # Для скана документов нужна vision-модель (VL). Текстовые Qwen3.5-* дают пустой content на image_url.
+    hf_model: str = Field(
+        default="Qwen/Qwen3-VL-30B-A3B-Instruct:novita",
+        validation_alias="HF_MODEL",
+    )
     hf_fallback_model: str = Field(default="", validation_alias="MODEL_2")
+    # Используется при необходимости; InferenceClient ходит в HF Inference API.
     hf_base_url: str = Field(default="https://router.huggingface.co/v1", validation_alias="HF_BASE_URL")
     max_file_size_mb: int = Field(default=10, validation_alias="MAX_FILE_SIZE_MB")
     hf_request_timeout_sec: int = Field(default=90, validation_alias="HF_REQUEST_TIMEOUT_SEC")
 
+    @field_validator("hf_model", "hf_fallback_model", mode="before")
+    @classmethod
+    def normalize_hf_model_id(cls, v: object) -> object:
+        """Убираем пробелы и случайную точку в конце строки из .env (иначе HFValidationError на repo id)."""
+        if not isinstance(v, str):
+            return v
+        s = v.strip()
+        while s.endswith("."):
+            s = s[:-1]
+        return s
+
 
 settings = Settings()
+
+
+def _parse_router_model_id(spec: str) -> tuple[str, str | None]:
+    """Разделяет Hub repo id и суффикс провайдера Router (например :together, :novita).
+
+    InferenceClient ожидает в `model` только валидный repo id; провайдер задаётся отдельно.
+    """
+    spec = spec.strip()
+    if not spec or ":" not in spec:
+        return spec, None
+    left, right = spec.rsplit(":", 1)
+    if not left or not right or "/" not in left or "/" in right:
+        return spec, None
+    return left, right
+
+
+def _inference_client_for_provider(provider: str | None) -> InferenceClient:
+    kwargs: dict[str, Any] = {
+        "token": settings.hf_token,
+        "timeout": float(settings.hf_request_timeout_sec),
+    }
+    if provider:
+        kwargs["provider"] = provider
+    return InferenceClient(**kwargs)
+
+
 logger = logging.getLogger(__name__)
 
 router = APIRouter(tags=["passport"])
@@ -103,13 +145,6 @@ class UnifiedDocumentsScanResponse(BaseModel):
     model: str
     data: UnifiedDocumentsData
     raw_text: Dict[str, str]
-
-
-client = OpenAI(
-    base_url=settings.hf_base_url,
-    api_key=settings.hf_token,
-    timeout=float(settings.hf_request_timeout_sec),
-)
 
 
 def validate_file_size(contents: bytes) -> None:
@@ -428,6 +463,30 @@ def extract_json_from_text(text: str) -> Dict[str, Any]:
     raise ValueError("Не удалось извлечь JSON из ответа модели")
 
 
+def _looks_like_russian_patronymic(s: str) -> bool:
+    """Грубая проверка: отчество обычно оканчивается на -ович/-евич/-ич/-овна/-евна и т.д."""
+    t = re.sub(r"\s+", "", str(s or "")).upper()
+    if len(t) < 4:
+        return False
+    return bool(
+        re.search(
+            r"(ОВИЧ|ЕВИЧ|ЬЕВИЧ|ОВНА|ЕВНА|ИНИЧНА|ИЧНА|ИЧ)$",
+            t,
+        )
+    )
+
+
+def _maybe_swap_name_and_patronymic(name: str, patronymic: str) -> tuple[str, str]:
+    """Модели часто путают имя и отчество: исправляем, если одно явно похоже на отчество, другое — нет."""
+    n, p = str(name or "").strip(), str(patronymic or "").strip()
+    if not n or not p:
+        return n, p
+    n_pat, p_pat = _looks_like_russian_patronymic(n), _looks_like_russian_patronymic(p)
+    if n_pat and not p_pat:
+        return p, n
+    return n, p
+
+
 def normalize_passport_data(payload: Dict[str, Any]) -> PassportData:
     def _normalize_date(value: str) -> str:
         s = str(value or "").strip()
@@ -450,6 +509,10 @@ def normalize_passport_data(payload: Dict[str, Any]) -> PassportData:
         f"{dept_digits[:3]}-{dept_digits[3:6]}" if len(dept_digits) >= 6 else dept_raw.strip()
     )
 
+    raw_name = str(payload.get("name", "") or "")
+    raw_patronymic = str(payload.get("patronymic", "") or "")
+    name, patronymic = _maybe_swap_name_and_patronymic(raw_name, raw_patronymic)
+
     return PassportData(
         issuing_authority=str(payload.get("issuing_authority", "") or ""),
         issue_date=_normalize_date(str(payload.get("issue_date", "") or "")),
@@ -457,8 +520,8 @@ def normalize_passport_data(payload: Dict[str, Any]) -> PassportData:
         passport_series=_digits_only(str(payload.get("passport_series", "") or ""))[:4],
         passport_number=_digits_only(str(payload.get("passport_number", "") or ""))[:6],
         surname=str(payload.get("surname", "") or ""),
-        name=str(payload.get("name", "") or ""),
-        patronymic=str(payload.get("patronymic", "") or ""),
+        name=name,
+        patronymic=patronymic,
         gender=str(payload.get("gender", "") or ""),
         birth_date=_normalize_date(str(payload.get("birth_date", "") or "")),
         birth_place=str(payload.get("birth_place", "") or ""),
@@ -687,6 +750,11 @@ def build_prompt() -> str:
 - Не выдумывай значения.
 - Даты приводи к формату DD.MM.YYYY, если это возможно.
 - passport_series и passport_number верни отдельно, если это возможно.
+- ФИО (критично): на развороте РФ обычно три отдельных поля/строки — фамилия, имя, отчество сверху вниз или слева направо.
+  - surname — только фамилия.
+  - name — только личное имя (например Вячеслав, Мария), не отчество.
+  - patronymic — только отчество; в русском языке чаще оканчивается на -ович/-евич/-ич (муж.) или -овна/-евна/-инична (жен.).
+  Не путай: отчество никогда не клади в name, а имя — в patronymic.
 - confidence_note: коротко укажи, какие поля могли быть распознаны неуверенно.
 """.strip()
 
@@ -904,14 +972,17 @@ async def enrich_egrn_fields(egrn_bytes: bytes, current: EgrnExtractData) -> Egr
 async def run_hf_document_extraction(contents: bytes, prompt: str, max_tokens: int = 700) -> tuple[str, str]:
     contents = upscale_jpeg_for_ocr(contents, scale=2.5)
     mime = detect_mime(contents)
-    image_url = image_to_data_url(contents, mime)
 
     # Жёсткий предел: если HTTP-клиент HF не вернёт управление, поток не должен висеть вечно.
     hard_timeout_sec = float(settings.hf_request_timeout_sec) + 45.0
 
+    image_url = image_to_data_url(contents, mime)
+
     def _chat_completion_for_model(model_name: str):
+        repo_id, provider = _parse_router_model_id(model_name)
+        client = _inference_client_for_provider(provider)
         return client.chat.completions.create(
-            model=model_name,
+            model=repo_id,
             messages=[
                 {
                     "role": "user",
@@ -925,20 +996,43 @@ async def run_hf_document_extraction(contents: bytes, prompt: str, max_tokens: i
             temperature=0,
         )
 
+    def _text_from_completion(completion: Any) -> str:
+        raw = completion.choices[0].message.content
+        return _message_content_to_str(raw)
+
     def _sync_chat_completion() -> tuple[Any, str]:
         primary = settings.hf_model
         fallback = settings.hf_fallback_model.strip()
         try:
-            return _chat_completion_for_model(primary), primary
+            completion, used = _chat_completion_for_model(primary), primary
         except Exception as e:
             # На router-маршруте иногда модель/провайдер может быть недоступен.
             if fallback and fallback != primary:
                 logger.warning(
-                    "HF router primary model failed, switching to fallback",
+                    "HF inference primary model failed, switching to fallback",
                     extra={"primary_model": primary, "fallback_model": fallback},
                 )
-                return _chat_completion_for_model(fallback), fallback
-            raise e
+                completion, used = _chat_completion_for_model(fallback), fallback
+            else:
+                raise e
+
+        # Текстовые модели часто возвращают HTTP 200 и пустой content на image_url — пробуем fallback (обычно VL).
+        if (
+            not _text_from_completion(completion)
+            and fallback
+            and fallback != primary
+            and used == primary
+        ):
+            logger.warning(
+                "HF inference primary returned empty content (often non-VL model), switching to fallback",
+                extra={"primary_model": primary, "fallback_model": fallback},
+            )
+            completion, used = _chat_completion_for_model(fallback), fallback
+
+        if not _text_from_completion(completion):
+            raise ValueError("empty content")
+
+        return completion, used
 
     last_error: Exception | None = None
     last_error_cause: BaseException | None = None
@@ -954,16 +1048,8 @@ async def run_hf_document_extraction(contents: bytes, prompt: str, max_tokens: i
                 status_code=504,
                 detail=(
                     f"Превышено время ожидания ответа от Hugging Face (~{int(hard_timeout_sec)} с). "
-                    "Для скана паспорта нужна vision-модель (например Qwen/Qwen2.5-VL-7B-Instruct в HF_MODEL). "
+                    "Для скана паспорта нужна vision-модель (например Qwen/Qwen3-VL-30B-A3B-Instruct:novita в HF_MODEL). "
                     "Проверьте .env и HF_REQUEST_TIMEOUT_SEC."
-                ),
-            ) from e
-        except APITimeoutError as e:
-            raise HTTPException(
-                status_code=504,
-                detail=(
-                    f"Превышено время ожидания ответа от Hugging Face Router ({settings.hf_request_timeout_sec} с). "
-                    "Повторите позже, смените модель в .env (HF_MODEL) или увеличьте HF_REQUEST_TIMEOUT_SEC."
                 ),
             ) from e
         except Exception as e:
@@ -983,19 +1069,18 @@ async def run_hf_document_extraction(contents: bytes, prompt: str, max_tokens: i
     else:
         tech_error = repr(last_error) if last_error else "unknown"
         tech_cause = repr(last_error_cause) if last_error_cause else "unknown"
-        raise HTTPException(
-            status_code=502,
-            detail=(
-                "Hugging Face временно недоступен. "
-                "Попробуйте повторить запрос через 10-30 секунд "
-                "или используйте режим Tesseract. "
-                f"Техническая ошибка: {tech_error}. "
-                f"Причина: {tech_cause}. "
-                f"Модель: {settings.hf_model}. "
-                f"Fallback: {settings.hf_fallback_model or 'не задан'}. "
-                f"Таймаут HTTP: {settings.hf_request_timeout_sec} сек."
-            ),
+        detail = (
+            "Hugging Face временно недоступен. "
+            "Попробуйте повторить запрос через 10-30 секунд "
+            "или используйте режим Tesseract. "
+            f"Техническая ошибка: {tech_error} "
+            f"Причина: {tech_cause}; "
+            f"модель: {settings.hf_model}; "
+            f"fallback: {settings.hf_fallback_model or 'не задан'}; "
+            f"таймаут HTTP: {settings.hf_request_timeout_sec} с."
         )
+        logger.error("HF: все попытки исчерпаны: %s", detail)
+        raise HTTPException(status_code=502, detail=detail)
 
     try:
         raw = completion.choices[0].message.content
@@ -1122,7 +1207,11 @@ async def scan_documents_unified(
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=502, detail=f"Ошибка сканирования документов: {e!r}") from e
+        logger.exception("scan-documents-unified: неожиданная ошибка до разбора JSON")
+        raise HTTPException(
+            status_code=502,
+            detail=f"Ошибка сканирования документов: {e!r}",
+        ) from e
 
     try:
         passport_data = normalize_passport_data(extract_json_from_text(passport_raw))
