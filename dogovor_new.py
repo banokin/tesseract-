@@ -17,6 +17,7 @@ from dogovor import (
 )
 from scan_passport_hf import (
     extract_json_from_text,
+    pdf_first_page_to_png,
     run_hf_passport_extraction,
     settings as hf_settings,
     validate_image,
@@ -129,11 +130,15 @@ def unified_json_to_contract_data(payload: Mapping[str, Any]) -> ContractData:
 @router.post("/scan-passport-to-contract-hf")
 async def scan_passport_to_contract_hf(file: UploadFile = File(...)):
     """Скан паспорта через HF → JSON → заполнение шаблона договора."""
-    if not file.content_type or not file.content_type.startswith("image/"):
-        raise HTTPException(status_code=400, detail="Загрузите изображение паспорта")
+    file_type = (file.content_type or "").lower()
+    if not (file_type.startswith("image/") or file_type == "application/pdf"):
+        raise HTTPException(status_code=400, detail="Загрузите изображение или PDF паспорта")
 
     contents = await file.read()
-    validate_image(contents)
+    if file_type == "application/pdf":
+        contents = pdf_first_page_to_png(contents)
+    else:
+        validate_image(contents)
 
     raw_text, model_used = await run_hf_passport_extraction(contents)
     try:

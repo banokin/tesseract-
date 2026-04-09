@@ -18,8 +18,8 @@ st.title("Скан паспорта — Tesseract")
 st.caption("Распознавание текста паспорта через Tesseract (сырой OCR-текст).")
 
 passport_file = st.file_uploader(
-    "Загрузите фото паспорта",
-    type=["png", "jpg", "jpeg", "webp"],
+    "Загрузите фото паспорта или PDF",
+    type=["png", "jpg", "jpeg", "webp", "pdf"],
     key="passport_tesseract_uploader",
 )
 

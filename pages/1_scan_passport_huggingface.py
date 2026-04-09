@@ -33,8 +33,8 @@ st.session_state.setdefault("hf_contract_docx_bytes", None)
 st.session_state.setdefault("hf_contract_filename", None)
 
 passport_file = st.file_uploader(
-    "Загрузите фото паспорта",
-    type=["png", "jpg", "jpeg", "webp"],
+    "Загрузите фото паспорта или PDF",
+    type=["png", "jpg", "jpeg", "webp", "pdf"],
     key="passport_hf_uploader",
 )
 

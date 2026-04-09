@@ -163,7 +163,7 @@ def pdf_first_page_to_png(pdf_bytes: bytes) -> bytes:
         if doc.page_count < 1:
             raise HTTPException(status_code=400, detail="PDF-файл не содержит страниц")
         page = doc.load_page(0)
-        pix = page.get_pixmap(matrix=fitz.Matrix(2, 2), alpha=False)
+        pix = page.get_pixmap(matrix=fitz.Matrix(2.5, 2.5), alpha=False)
         png_bytes = pix.tobytes("png")
         validate_image(png_bytes)
         return png_bytes
@@ -407,23 +407,56 @@ def extract_json_from_text(text: str) -> Dict[str, Any]:
 
 
 def normalize_passport_data(payload: Dict[str, Any]) -> PassportData:
+    def _normalize_date(value: str) -> str:
+        s = str(value or "").strip()
+        if not s:
+            return ""
+        m = re.search(r"\b(\d{2})[.\-/](\d{2})[.\-/](\d{4})\b", s)
+        if m:
+            return f"{m.group(1)}.{m.group(2)}.{m.group(3)}"
+        m = re.search(r"\b(\d{4})[.\-/](\d{2})[.\-/](\d{2})\b", s)
+        if m:
+            return f"{m.group(3)}.{m.group(2)}.{m.group(1)}"
+        return s
+
+    def _digits_only(value: str) -> str:
+        return re.sub(r"\D+", "", str(value or ""))
+
+    dept_raw = str(payload.get("department_code", "") or "")
+    dept_digits = _digits_only(dept_raw)
+    department_code = (
+        f"{dept_digits[:3]}-{dept_digits[3:6]}" if len(dept_digits) >= 6 else dept_raw.strip()
+    )
+
     return PassportData(
         issuing_authority=str(payload.get("issuing_authority", "") or ""),
-        issue_date=str(payload.get("issue_date", "") or ""),
-        department_code=str(payload.get("department_code", "") or ""),
-        passport_series=str(payload.get("passport_series", "") or ""),
-        passport_number=str(payload.get("passport_number", "") or ""),
+        issue_date=_normalize_date(str(payload.get("issue_date", "") or "")),
+        department_code=department_code,
+        passport_series=_digits_only(str(payload.get("passport_series", "") or ""))[:4],
+        passport_number=_digits_only(str(payload.get("passport_number", "") or ""))[:6],
         surname=str(payload.get("surname", "") or ""),
         name=str(payload.get("name", "") or ""),
         patronymic=str(payload.get("patronymic", "") or ""),
         gender=str(payload.get("gender", "") or ""),
-        birth_date=str(payload.get("birth_date", "") or ""),
+        birth_date=_normalize_date(str(payload.get("birth_date", "") or "")),
         birth_place=str(payload.get("birth_place", "") or ""),
         confidence_note=str(payload.get("confidence_note", "") or ""),
     )
 
 
 def normalize_registration_data(payload: Dict[str, Any]) -> PassportRegistrationData:
+    def _normalize_date(value: str) -> str:
+        s = str(value or "").strip()
+        if not s:
+            return ""
+        m = re.search(r"\b(\d{2})[.\-/](\d{2})[.\-/](\d{4})\b", s)
+        if m:
+            return f"{m.group(1)}.{m.group(2)}.{m.group(3)}"
+        m = re.search(r"\b(\d{4})[.\-/](\d{2})[.\-/](\d{2})\b", s)
+        if m:
+            return f"{m.group(3)}.{m.group(2)}.{m.group(1)}"
+        return s
+
     return PassportRegistrationData(
         region=str(payload.get("region", "") or ""),
         city=str(payload.get("city", "") or ""),
@@ -432,12 +465,47 @@ def normalize_registration_data(payload: Dict[str, Any]) -> PassportRegistration
         house=str(payload.get("house", "") or ""),
         building=str(payload.get("building", "") or ""),
         apartment=str(payload.get("apartment", "") or ""),
-        registration_date=str(payload.get("registration_date", "") or ""),
+        registration_date=_normalize_date(str(payload.get("registration_date", "") or "")),
         confidence_note=str(payload.get("confidence_note", "") or ""),
     )
 
 
 def normalize_egrn_data(payload: Dict[str, Any]) -> EgrnExtractData:
+    def _first_non_empty(*keys: str) -> str:
+        for key in keys:
+            value = payload.get(key)
+            if value is None:
+                continue
+            s = str(value).strip()
+            if s:
+                return s
+        return ""
+
+    def _normalize_area(value: str) -> str:
+        if not value:
+            return ""
+        text = value.replace(",", ".")
+        text = re.sub(r"[^\d.]", "", text)
+        if not text:
+            return ""
+        m = re.search(r"\d+(?:\.\d+)?", text)
+        if not m:
+            return ""
+        number = m.group(0)
+        return number.rstrip("0").rstrip(".") if "." in number else number
+
+    def _normalize_date(value: str) -> str:
+        if not value:
+            return ""
+        s = str(value).strip()
+        m = re.search(r"\b(\d{2})[.\-/](\d{2})[.\-/](\d{4})\b", s)
+        if m:
+            return f"{m.group(1)}.{m.group(2)}.{m.group(3)}"
+        m = re.search(r"\b(\d{4})[.\-/](\d{2})[.\-/](\d{2})\b", s)
+        if m:
+            return f"{m.group(3)}.{m.group(2)}.{m.group(1)}"
+        return s
+
     raw_holders = payload.get("right_holders", [])
     right_holders: List[str]
     if isinstance(raw_holders, list):
@@ -448,15 +516,62 @@ def normalize_egrn_data(payload: Dict[str, Any]) -> EgrnExtractData:
         right_holders = []
 
     return EgrnExtractData(
-        cadastral_number=str(payload.get("cadastral_number", "") or ""),
-        object_type=str(payload.get("object_type", "") or ""),
-        address=str(payload.get("address", "") or ""),
-        area_sq_m=str(payload.get("area_sq_m", "") or ""),
-        ownership_type=str(payload.get("ownership_type", "") or ""),
+        cadastral_number=_first_non_empty("cadastral_number", "cad_number", "cadastralNo"),
+        object_type=_first_non_empty("object_type", "property_type", "object_name", "kind"),
+        address=_first_non_empty("address", "object_address", "property_address"),
+        area_sq_m=_normalize_area(_first_non_empty("area_sq_m", "area", "total_area", "square")),
+        ownership_type=_first_non_empty("ownership_type", "right_type", "purpose"),
         right_holders=right_holders,
-        extract_date=str(payload.get("extract_date", "") or ""),
-        confidence_note=str(payload.get("confidence_note", "") or ""),
+        extract_date=_normalize_date(_first_non_empty("extract_date", "statement_date", "egrn_date", "date")),
+        confidence_note=_first_non_empty("confidence_note", "note"),
     )
+
+
+def _passport_missing_or_invalid_fields(data: PassportData) -> List[str]:
+    fields: List[str] = []
+    if not data.surname.strip():
+        fields.append("surname")
+    if not data.name.strip():
+        fields.append("name")
+    if not re.fullmatch(r"\d{4}", data.passport_series.strip() or ""):
+        fields.append("passport_series")
+    if not re.fullmatch(r"\d{6}", data.passport_number.strip() or ""):
+        fields.append("passport_number")
+    if data.department_code.strip() and not re.fullmatch(r"\d{3}-\d{3}", data.department_code.strip()):
+        fields.append("department_code")
+    if data.issue_date.strip() and not re.fullmatch(r"\d{2}\.\d{2}\.\d{4}", data.issue_date.strip()):
+        fields.append("issue_date")
+    if data.birth_date.strip() and not re.fullmatch(r"\d{2}\.\d{2}\.\d{4}", data.birth_date.strip()):
+        fields.append("birth_date")
+    return list(dict.fromkeys(fields))
+
+
+def _registration_missing_or_invalid_fields(data: PassportRegistrationData) -> List[str]:
+    fields: List[str] = []
+    if not any([data.city.strip(), data.settlement.strip(), data.street.strip()]):
+        fields.extend(["city", "settlement", "street"])
+    if not data.house.strip():
+        fields.append("house")
+    if data.registration_date.strip() and not re.fullmatch(r"\d{2}\.\d{2}\.\d{4}", data.registration_date.strip()):
+        fields.append("registration_date")
+    return list(dict.fromkeys(fields))
+
+
+def _egrn_missing_or_invalid_fields(data: EgrnExtractData) -> List[str]:
+    fields: List[str] = []
+    if not re.fullmatch(r"\d{2}:\d{2}:\d{7,}:\d+", data.cadastral_number.strip() or ""):
+        fields.append("cadastral_number")
+    if not data.object_type.strip():
+        fields.append("object_type")
+    if not data.address.strip():
+        fields.append("address")
+    if not re.fullmatch(r"\d+(?:\.\d+)?", data.area_sq_m.strip() or ""):
+        fields.append("area_sq_m")
+    if data.extract_date.strip() and not re.fullmatch(r"\d{2}\.\d{2}\.\d{4}", data.extract_date.strip()):
+        fields.append("extract_date")
+    if not data.extract_date.strip():
+        fields.append("extract_date")
+    return list(dict.fromkeys(fields))
 
 
 def extract_generic_json_from_text(text: str) -> Dict[str, Any]:
@@ -612,6 +727,158 @@ def build_egrn_prompt() -> str:
 """.strip()
 
 
+def _build_focus_prompt(title: str, missing_fields: List[str], extra_rules: List[str]) -> str:
+    fields_json = ",\n  ".join(f'"{field}": ""' for field in missing_fields)
+    rules = "\n".join(f"- {rule}" for rule in extra_rules)
+    return f"""
+Ты OCR/Document AI модуль.
+{title}
+
+Верни ответ СТРОГО в JSON без markdown и без пояснений.
+Не добавляй текст до JSON и после JSON.
+
+Формат ответа:
+{{
+  {fields_json},
+  "confidence_note": ""
+}}
+
+Правила:
+- Верни только перечисленные поля + confidence_note.
+- Если поле не найдено уверенно, верни пустую строку.
+- Не выдумывай значения.
+{rules}
+""".strip()
+
+
+def build_passport_focus_prompt(fields: List[str]) -> str:
+    return _build_focus_prompt(
+        "На изображении паспорта извлеки ТОЛЬКО недостающие/невалидные поля.",
+        fields,
+        [
+            "Для дат используй формат DD.MM.YYYY.",
+            "passport_series — ровно 4 цифры, passport_number — ровно 6 цифр.",
+            "department_code — формат XXX-XXX.",
+        ],
+    )
+
+
+def build_registration_focus_prompt(fields: List[str]) -> str:
+    return _build_focus_prompt(
+        "На изображении страницы прописки извлеки ТОЛЬКО недостающие/невалидные поля.",
+        fields,
+        [
+            "Для registration_date используй формат DD.MM.YYYY.",
+            "Если город отсутствует, используй settlement.",
+            "house укажи как номер дома без префикса.",
+        ],
+    )
+
+
+def build_egrn_focus_prompt(fields: List[str]) -> str:
+    return _build_focus_prompt(
+        "На изображении/странице ЕГРН извлеки ТОЛЬКО недостающие/невалидные поля.",
+        fields,
+        [
+            "Для даты используй формат DD.MM.YYYY.",
+            "Для площади верни только число в м2 (например 47.3).",
+            "cadastral_number верни в формате 77:04:0002001:9976 (цифры и двоеточия).",
+        ],
+    )
+
+
+async def enrich_passport_fields(contents: bytes, current: PassportData) -> PassportData:
+    fields = _passport_missing_or_invalid_fields(current)
+    if not fields:
+        return current
+
+    try:
+        focused_raw, _ = await run_hf_document_extraction(
+            contents,
+            build_passport_focus_prompt(fields),
+            max_tokens=350,
+        )
+        focused_payload = extract_json_from_text(focused_raw)
+        focused = normalize_passport_data(focused_payload)
+    except Exception:
+        return current
+
+    merged = PassportData(
+        issuing_authority=current.issuing_authority or focused.issuing_authority,
+        issue_date=current.issue_date or focused.issue_date,
+        department_code=current.department_code or focused.department_code,
+        passport_series=current.passport_series or focused.passport_series,
+        passport_number=current.passport_number or focused.passport_number,
+        surname=current.surname or focused.surname,
+        name=current.name or focused.name,
+        patronymic=current.patronymic or focused.patronymic,
+        gender=current.gender or focused.gender,
+        birth_date=current.birth_date or focused.birth_date,
+        birth_place=current.birth_place or focused.birth_place,
+        confidence_note=(current.confidence_note or focused.confidence_note).strip(),
+    )
+    return merged
+
+
+async def enrich_registration_fields(
+    contents: bytes, current: PassportRegistrationData
+) -> PassportRegistrationData:
+    fields = _registration_missing_or_invalid_fields(current)
+    if not fields:
+        return current
+    try:
+        focused_raw, _ = await run_hf_document_extraction(
+            contents,
+            build_registration_focus_prompt(fields),
+            max_tokens=300,
+        )
+        focused_payload = extract_generic_json_from_text(focused_raw)
+        focused = normalize_registration_data(focused_payload)
+    except Exception:
+        return current
+
+    merged = PassportRegistrationData(
+        region=current.region or focused.region,
+        city=current.city or focused.city,
+        settlement=current.settlement or focused.settlement,
+        street=current.street or focused.street,
+        house=current.house or focused.house,
+        building=current.building or focused.building,
+        apartment=current.apartment or focused.apartment,
+        registration_date=current.registration_date or focused.registration_date,
+        confidence_note=(current.confidence_note or focused.confidence_note).strip(),
+    )
+    return merged
+
+
+async def enrich_egrn_fields(egrn_bytes: bytes, current: EgrnExtractData) -> EgrnExtractData:
+    fields = _egrn_missing_or_invalid_fields(current)
+    if not fields:
+        return current
+    try:
+        focused_raw, _ = await run_hf_document_extraction(
+            egrn_bytes,
+            build_egrn_focus_prompt(fields),
+            max_tokens=350,
+        )
+        focused_payload = extract_generic_json_from_text(focused_raw)
+        focused = normalize_egrn_data(focused_payload)
+    except Exception:
+        return current
+
+    merged = EgrnExtractData(
+        cadastral_number=current.cadastral_number or focused.cadastral_number,
+        object_type=current.object_type or focused.object_type,
+        address=current.address or focused.address,
+        area_sq_m=current.area_sq_m or focused.area_sq_m,
+        ownership_type=current.ownership_type or focused.ownership_type,
+        right_holders=current.right_holders or focused.right_holders,
+        extract_date=current.extract_date or focused.extract_date,
+        confidence_note=(current.confidence_note or focused.confidence_note).strip(),
+    )
+    return merged
+
+
 async def run_hf_document_extraction(contents: bytes, prompt: str, max_tokens: int = 700) -> tuple[str, str]:
     mime = detect_mime(contents)
     image_url = image_to_data_url(contents, mime)
@@ -726,17 +993,22 @@ async def run_hf_passport_extraction(contents: bytes) -> tuple[str, str]:
 
 @router.post("/scan-passport", response_model=PassportScanResponse)
 async def scan_passport(file: UploadFile = File(...)) -> PassportScanResponse:
-    if not file.content_type or not file.content_type.startswith("image/"):
-        raise HTTPException(status_code=400, detail="Загрузите изображение")
+    file_type = (file.content_type or "").lower()
+    if not (file_type.startswith("image/") or file_type == "application/pdf"):
+        raise HTTPException(status_code=400, detail="Загрузите изображение или PDF")
 
     contents = await file.read()
-    validate_image(contents)
+    if file_type == "application/pdf":
+        contents = pdf_first_page_to_png(contents)
+    else:
+        validate_image(contents)
 
     raw_text, model_used = await run_hf_passport_extraction(contents)
 
     try:
         parsed = extract_json_from_text(raw_text)
         passport_data = normalize_passport_data(parsed)
+        passport_data = await enrich_passport_fields(contents, passport_data)
     except Exception as e:
         # Last-resort: не падаем 500, если удалось достать поля эвристикой.
         normalized = _normalize_jsonish_text(raw_text)
@@ -771,10 +1043,12 @@ async def scan_documents_unified(
     passport_registration: UploadFile = File(...),
     egrn_extract: UploadFile = File(...),
 ) -> UnifiedDocumentsScanResponse:
-    if not passport_main.content_type or not passport_main.content_type.startswith("image/"):
-        raise HTTPException(status_code=400, detail="passport_main: загрузите изображение")
-    if not passport_registration.content_type or not passport_registration.content_type.startswith("image/"):
-        raise HTTPException(status_code=400, detail="passport_registration: загрузите изображение")
+    main_type = (passport_main.content_type or "").lower()
+    reg_type = (passport_registration.content_type or "").lower()
+    if not (main_type.startswith("image/") or main_type == "application/pdf"):
+        raise HTTPException(status_code=400, detail="passport_main: загрузите изображение или PDF")
+    if not (reg_type.startswith("image/") or reg_type == "application/pdf"):
+        raise HTTPException(status_code=400, detail="passport_registration: загрузите изображение или PDF")
     egrn_type = (egrn_extract.content_type or "").lower()
     if not (egrn_type.startswith("image/") or egrn_type == "application/pdf"):
         raise HTTPException(
@@ -786,8 +1060,18 @@ async def scan_documents_unified(
     registration_bytes = await passport_registration.read()
     egrn_bytes = await egrn_extract.read()
 
-    validate_image(main_bytes)
-    validate_image(registration_bytes)
+    if main_type == "application/pdf":
+        main_ocr_bytes = pdf_first_page_to_png(main_bytes)
+    else:
+        validate_image(main_bytes)
+        main_ocr_bytes = main_bytes
+
+    if reg_type == "application/pdf":
+        registration_ocr_bytes = pdf_first_page_to_png(registration_bytes)
+    else:
+        validate_image(registration_bytes)
+        registration_ocr_bytes = registration_bytes
+
     if egrn_type == "application/pdf":
         egrn_ocr_bytes = pdf_first_page_to_png(egrn_bytes)
     else:
@@ -795,9 +1079,9 @@ async def scan_documents_unified(
         egrn_ocr_bytes = egrn_bytes
 
     try:
-        passport_raw, model_used = await run_hf_passport_extraction(main_bytes)
+        passport_raw, model_used = await run_hf_passport_extraction(main_ocr_bytes)
         registration_raw, _ = await run_hf_document_extraction(
-            registration_bytes,
+            registration_ocr_bytes,
             build_registration_prompt(),
             max_tokens=600,
         )
@@ -813,6 +1097,7 @@ async def scan_documents_unified(
 
     try:
         passport_data = normalize_passport_data(extract_json_from_text(passport_raw))
+        passport_data = await enrich_passport_fields(main_ocr_bytes, passport_data)
     except Exception as e:
         raise HTTPException(
             status_code=500,
@@ -823,6 +1108,9 @@ async def scan_documents_unified(
         registration_data = normalize_registration_data(
             extract_generic_json_from_text(registration_raw)
         )
+        registration_data = await enrich_registration_fields(
+            registration_ocr_bytes, registration_data
+        )
     except Exception as e:
         raise HTTPException(
             status_code=500,
@@ -831,6 +1119,7 @@ async def scan_documents_unified(
 
     try:
         egrn_data = normalize_egrn_data(extract_generic_json_from_text(egrn_raw))
+        egrn_data = await enrich_egrn_fields(egrn_ocr_bytes, egrn_data)
     except Exception as e:
         raise HTTPException(
             status_code=500,
