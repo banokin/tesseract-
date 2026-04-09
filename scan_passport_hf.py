@@ -1102,16 +1102,22 @@ async def scan_documents_unified(
         egrn_ocr_bytes = egrn_bytes
 
     try:
-        passport_raw, model_used = await run_hf_passport_extraction(main_ocr_bytes)
-        registration_raw, _ = await run_hf_document_extraction(
-            registration_ocr_bytes,
-            build_registration_prompt(),
-            max_tokens=600,
-        )
-        egrn_raw, _ = await run_hf_document_extraction(
-            egrn_ocr_bytes,
-            build_egrn_prompt(),
-            max_tokens=700,
+        (
+            (passport_raw, model_used),
+            (registration_raw, _),
+            (egrn_raw, _),
+        ) = await asyncio.gather(
+            run_hf_passport_extraction(main_ocr_bytes),
+            run_hf_document_extraction(
+                registration_ocr_bytes,
+                build_registration_prompt(),
+                max_tokens=600,
+            ),
+            run_hf_document_extraction(
+                egrn_ocr_bytes,
+                build_egrn_prompt(),
+                max_tokens=700,
+            ),
         )
     except HTTPException:
         raise
@@ -1120,7 +1126,6 @@ async def scan_documents_unified(
 
     try:
         passport_data = normalize_passport_data(extract_json_from_text(passport_raw))
-        passport_data = await enrich_passport_fields(main_ocr_bytes, passport_data)
     except Exception as e:
         raise HTTPException(
             status_code=500,
@@ -1131,9 +1136,6 @@ async def scan_documents_unified(
         registration_data = normalize_registration_data(
             extract_generic_json_from_text(registration_raw)
         )
-        registration_data = await enrich_registration_fields(
-            registration_ocr_bytes, registration_data
-        )
     except Exception as e:
         raise HTTPException(
             status_code=500,
@@ -1142,12 +1144,17 @@ async def scan_documents_unified(
 
     try:
         egrn_data = normalize_egrn_data(extract_generic_json_from_text(egrn_raw))
-        egrn_data = await enrich_egrn_fields(egrn_ocr_bytes, egrn_data)
     except Exception as e:
         raise HTTPException(
             status_code=500,
             detail=f"Не удалось разобрать JSON выписки ЕГРН: {egrn_raw[:1000]}",
         ) from e
+
+    passport_data, registration_data, egrn_data = await asyncio.gather(
+        enrich_passport_fields(main_ocr_bytes, passport_data),
+        enrich_registration_fields(registration_ocr_bytes, registration_data),
+        enrich_egrn_fields(egrn_ocr_bytes, egrn_data),
+    )
 
     return UnifiedDocumentsScanResponse(
         ok=True,
