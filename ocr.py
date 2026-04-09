@@ -62,6 +62,28 @@ def convert_pdf_first_page_to_png(pdf_bytes: bytes) -> bytes:
         raise HTTPException(status_code=400, detail=f"Не удалось обработать PDF: {e!r}") from e
 
 
+def upscale_jpeg_for_ocr(image_bytes: bytes, scale: float = 2.5) -> bytes:
+    try:
+        image = Image.open(io.BytesIO(image_bytes))
+        image.load()
+    except Exception:
+        return image_bytes
+
+    image_format = (image.format or "").upper()
+    if image_format not in {"JPEG", "JPG"}:
+        return image_bytes
+
+    width, height = image.size
+    new_size = (
+        max(1, int(width * scale)),
+        max(1, int(height * scale)),
+    )
+    resized = image.resize(new_size, Image.Resampling.LANCZOS)
+    output = io.BytesIO()
+    resized.save(output, format="JPEG", quality=95, optimize=True)
+    return output.getvalue()
+
+
 def img_ocr(contents: bytes) -> str:
     try:
         image = Image.open(io.BytesIO(contents))
@@ -94,6 +116,8 @@ async def extract_text_from_upload(file: UploadFile) -> str:
     ct = (file.content_type or "").split(";")[0].strip().lower()
     if ext == ".pdf" or ct == "application/pdf":
         contents = convert_pdf_first_page_to_png(contents)
+    elif ext in {".jpg", ".jpeg"} or ct in {"image/jpeg", "image/jpg"}:
+        contents = upscale_jpeg_for_ocr(contents, scale=2.5)
     try:
         return await safe_to_thread(img_ocr, contents)
     except RuntimeError as e:

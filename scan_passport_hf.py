@@ -151,6 +151,28 @@ def image_to_data_url(contents: bytes, mime: str) -> str:
     return f"data:{mime};base64,{encoded}"
 
 
+def upscale_jpeg_for_ocr(image_bytes: bytes, scale: float = 2.5) -> bytes:
+    try:
+        image = Image.open(BytesIO(image_bytes))
+        image.load()
+    except Exception:
+        return image_bytes
+
+    image_format = (image.format or "").upper()
+    if image_format not in {"JPEG", "JPG"}:
+        return image_bytes
+
+    width, height = image.size
+    new_size = (
+        max(1, int(width * scale)),
+        max(1, int(height * scale)),
+    )
+    resized = image.resize(new_size, Image.Resampling.LANCZOS)
+    buffer = BytesIO()
+    resized.save(buffer, format="JPEG", quality=95, optimize=True)
+    return buffer.getvalue()
+
+
 def pdf_first_page_to_png(pdf_bytes: bytes) -> bytes:
     validate_file_size(pdf_bytes)
     if fitz is None:
@@ -880,6 +902,7 @@ async def enrich_egrn_fields(egrn_bytes: bytes, current: EgrnExtractData) -> Egr
 
 
 async def run_hf_document_extraction(contents: bytes, prompt: str, max_tokens: int = 700) -> tuple[str, str]:
+    contents = upscale_jpeg_for_ocr(contents, scale=2.5)
     mime = detect_mime(contents)
     image_url = image_to_data_url(contents, mime)
 
