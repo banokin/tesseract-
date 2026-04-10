@@ -38,6 +38,7 @@ async def safe_to_thread(func: Callable[P, T], *args: P.args, **kwargs: P.kwargs
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 TEMPLATE_CANDIDATES = (
+    BASE_DIR / "шаблон договора (1) (1) новый.docx",
     BASE_DIR / "шаблон договора (1) (1) новый.docx",
     BASE_DIR / "шаблон договора (1) (1).docx",
     BASE_DIR / "шаблон договора.docx",
