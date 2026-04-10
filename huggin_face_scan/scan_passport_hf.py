@@ -32,13 +32,12 @@ class Settings(BaseSettings):
         default="meta-llama/Llama-4-Scout-17B-16E-Instruct:novita",
         validation_alias="HF_MODEL",
     )
-    hf_fallback_model: str = Field(default="", validation_alias="MODEL_2")
     # Используется при необходимости; InferenceClient ходит в HF Inference API.
     hf_base_url: str = Field(default="https://router.huggingface.co/v1", validation_alias="HF_BASE_URL")
     max_file_size_mb: int = Field(default=10, validation_alias="MAX_FILE_SIZE_MB")
     hf_request_timeout_sec: int = Field(default=90, validation_alias="HF_REQUEST_TIMEOUT_SEC")
 
-    @field_validator("hf_model", "hf_fallback_model", mode="before")
+    @field_validator("hf_model", mode="before")
     @classmethod
     def normalize_hf_model_id(cls, v: object) -> object:
         """Убираем пробелы и случайную точку в конце строки из .env (иначе HFValidationError на repo id)."""
@@ -1015,8 +1014,8 @@ async def enrich_egrn_fields(egrn_bytes: bytes, current: EgrnExtractData) -> Egr
 
 
 async def run_hf_document_extraction(contents: bytes, prompt: str, max_tokens: int = 700) -> tuple[str, str]:
-    contents = upscale_jpeg_for_ocr(contents, scale=2.5)
-    mime = detect_mime(contents)
+    contents = await safe_to_thread(upscale_jpeg_for_ocr, contents, 2.5)
+    mime = await safe_to_thread(detect_mime, contents)
 
     # Жёсткий предел: если HTTP-клиент HF не вернёт управление, поток не должен висеть вечно.
     hard_timeout_sec = float(settings.hf_request_timeout_sec) + 45.0
@@ -1047,32 +1046,7 @@ async def run_hf_document_extraction(contents: bytes, prompt: str, max_tokens: i
 
     def _sync_chat_completion() -> tuple[Any, str]:
         primary = settings.hf_model
-        fallback = settings.hf_fallback_model.strip()
-        try:
-            completion, used = _chat_completion_for_model(primary), primary
-        except Exception as e:
-            # На router-маршруте иногда модель/провайдер может быть недоступен.
-            if fallback and fallback != primary:
-                logger.warning(
-                    "HF inference primary model failed, switching to fallback",
-                    extra={"primary_model": primary, "fallback_model": fallback},
-                )
-                completion, used = _chat_completion_for_model(fallback), fallback
-            else:
-                raise e
-
-        # Текстовые модели часто возвращают HTTP 200 и пустой content на image_url — пробуем fallback (обычно VL).
-        if (
-            not _text_from_completion(completion)
-            and fallback
-            and fallback != primary
-            and used == primary
-        ):
-            logger.warning(
-                "HF inference primary returned empty content (often non-VL model), switching to fallback",
-                extra={"primary_model": primary, "fallback_model": fallback},
-            )
-            completion, used = _chat_completion_for_model(fallback), fallback
+        completion, used = _chat_completion_for_model(primary), primary
 
         if not _text_from_completion(completion):
             raise ValueError("empty content")
@@ -1121,7 +1095,6 @@ async def run_hf_document_extraction(contents: bytes, prompt: str, max_tokens: i
             f"Техническая ошибка: {tech_error} "
             f"Причина: {tech_cause}; "
             f"модель: {settings.hf_model}; "
-            f"fallback: {settings.hf_fallback_model or 'не задан'}; "
             f"таймаут HTTP: {settings.hf_request_timeout_sec} с."
         )
         logger.error("HF: все попытки исчерпаны: %s", detail)
@@ -1152,9 +1125,9 @@ async def scan_passport(file: UploadFile = File(...)) -> PassportScanResponse:
 
     contents = await file.read()
     if file_type == "application/pdf":
-        contents = pdf_first_page_to_png(contents)
+        contents = await safe_to_thread(pdf_first_page_to_png, contents)
     else:
-        validate_image(contents)
+        await safe_to_thread(validate_image, contents)
 
     raw_text, model_used = await run_hf_passport_extraction(contents)
 
@@ -1213,23 +1186,17 @@ async def scan_documents_unified(
     registration_bytes = await passport_registration.read()
     egrn_bytes = await egrn_extract.read()
 
-    if main_type == "application/pdf":
-        main_ocr_bytes = pdf_first_page_to_png(main_bytes)
-    else:
-        validate_image(main_bytes)
-        main_ocr_bytes = main_bytes
+    async def _prepare_ocr_bytes(raw: bytes, content_type: str) -> bytes:
+        if content_type == "application/pdf":
+            return await safe_to_thread(pdf_first_page_to_png, raw)
+        await safe_to_thread(validate_image, raw)
+        return raw
 
-    if reg_type == "application/pdf":
-        registration_ocr_bytes = pdf_first_page_to_png(registration_bytes)
-    else:
-        validate_image(registration_bytes)
-        registration_ocr_bytes = registration_bytes
-
-    if egrn_type == "application/pdf":
-        egrn_ocr_bytes = pdf_first_page_to_png(egrn_bytes)
-    else:
-        validate_image(egrn_bytes)
-        egrn_ocr_bytes = egrn_bytes
+    main_ocr_bytes, registration_ocr_bytes, egrn_ocr_bytes = await asyncio.gather(
+        _prepare_ocr_bytes(main_bytes, main_type),
+        _prepare_ocr_bytes(registration_bytes, reg_type),
+        _prepare_ocr_bytes(egrn_bytes, egrn_type),
+    )
 
     try:
         (

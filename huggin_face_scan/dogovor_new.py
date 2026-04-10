@@ -38,6 +38,7 @@ async def safe_to_thread(func: Callable[P, T], *args: P.args, **kwargs: P.kwargs
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 TEMPLATE_CANDIDATES = (
+    BASE_DIR / "шаблон договора (1) (1) новый.docx",
     BASE_DIR / "шаблон договора (1) (1).docx",
     BASE_DIR / "шаблон договора.docx",
 )
@@ -224,7 +225,16 @@ def create_doc(contract_data: ContractData, output_path: Path) -> None:
         raise HTTPException(status_code=500, detail="Файл шаблона договора не найден")
 
     doc = DocxTemplate(str(template_path))
-    doc.render(contract_data.model_dump())
+    context = contract_data.model_dump()
+    # Гарантируем сокращенное ФИО для блока подписи (например: Иванов И.И.).
+    customer_fio = normalize_person_fio(str(context.get("customer_fio", "") or ""))
+    customer_fio_short = str(context.get("customer_fio_short", "") or "").strip()
+    if not customer_fio_short and customer_fio:
+        customer_fio_short = build_short_fio(customer_fio)
+    context["customer_fio_short"] = customer_fio_short
+    # Совместимость с новым шаблоном: customer_fio_abr ожидает сокращенное ФИО.
+    context["customer_fio_abr"] = customer_fio_short
+    doc.render(context)
     doc.save(str(output_path))
 
 
@@ -359,9 +369,9 @@ async def scan_passport_to_contract_hf(file: UploadFile = File(...)):
 
     contents = await file.read()
     if file_type == "application/pdf":
-        contents = pdf_first_page_to_png(contents)
+        contents = await safe_to_thread(pdf_first_page_to_png, contents)
     else:
-        validate_image(contents)
+        await safe_to_thread(validate_image, contents)
 
     raw_text, model_used = await run_hf_passport_extraction(contents)
     try:
