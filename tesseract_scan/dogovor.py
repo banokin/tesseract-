@@ -1,17 +1,31 @@
+import asyncio
 import re
 import uuid
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Callable, Mapping, ParamSpec, TypeVar
 
 from docxtpl import DocxTemplate
 from fastapi import APIRouter, File, HTTPException, UploadFile
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, ConfigDict, Field
 
-from async_utils import safe_to_thread
-from ocr import extract_text_from_upload
+from tesseract_scan.ocr import extract_text_from_upload
 
 router = APIRouter(tags=["dogovor"])
+
+P = ParamSpec("P")
+T = TypeVar("T")
+
+
+def _run_sync_guarded(func: Callable[P, T], *args: P.args, **kwargs: P.kwargs) -> T:
+    try:
+        return func(*args, **kwargs)
+    except StopIteration as e:
+        raise RuntimeError("Background sync function raised StopIteration") from e
+
+
+async def safe_to_thread(func: Callable[P, T], *args: P.args, **kwargs: P.kwargs) -> T:
+    return await asyncio.to_thread(_run_sync_guarded, func, *args, **kwargs)
 
 BASE_DIR = Path(__file__).resolve().parent
 TEMPLATE_CANDIDATES = (

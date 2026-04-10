@@ -8,15 +8,14 @@ import json
 import logging
 import re
 from io import BytesIO
-from typing import Any, Dict, List
+from typing import Any, Callable, Dict, List, ParamSpec, TypeVar
 
 from fastapi import APIRouter, File, HTTPException, UploadFile
 from huggingface_hub import InferenceClient
 from PIL import Image, UnidentifiedImageError
 from pydantic import BaseModel, Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
-from async_utils import safe_to_thread
-from ocr import extract_text_from_upload
+from tesseract_scan.ocr import extract_text_from_upload
 
 try:
     import fitz  # PyMuPDF
@@ -81,6 +80,20 @@ def _inference_client_for_provider(provider: str | None) -> InferenceClient:
 logger = logging.getLogger(__name__)
 
 router = APIRouter(tags=["passport"])
+
+P = ParamSpec("P")
+T = TypeVar("T")
+
+
+def _run_sync_guarded(func: Callable[P, T], *args: P.args, **kwargs: P.kwargs) -> T:
+    try:
+        return func(*args, **kwargs)
+    except StopIteration as e:
+        raise RuntimeError("Background sync function raised StopIteration") from e
+
+
+async def safe_to_thread(func: Callable[P, T], *args: P.args, **kwargs: P.kwargs) -> T:
+    return await asyncio.to_thread(_run_sync_guarded, func, *args, **kwargs)
 
 
 class PassportData(BaseModel):

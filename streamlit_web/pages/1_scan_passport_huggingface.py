@@ -83,51 +83,6 @@ if data:
         with st.expander("Сырой текст ответа модели"):
             st.text_area("Текст", raw_text, height=220, disabled=True)
 
-    snapshot = st.session_state.get("hf_passport_upload_snapshot")
-    can_build = snapshot is not None
-
-    st.subheader("Договор")
-    if st.button(
-        "Сформировать договор (.docx) по данным паспорта",
-        key="hf_build_contract",
-        disabled=not can_build,
-        help="Нужен успешный скан и тот же файл в сессии (пересканируйте при сбое).",
-    ):
-        name, body, ctype = snapshot
-        files = {"file": (name, body, ctype)}
-        try:
-            with st.spinner("Создаю договор на сервере..."):
-                response = requests.post(
-                    PASSPORT_TO_CONTRACT_HF_API_URL, files=files, timeout=HTTP_TIMEOUT
-                )
-            if response.status_code == 200:
-                payload = response.json()
-                download_url = payload.get("download_url")
-                if not download_url:
-                    st.error("API не вернул ссылку для скачивания договора.")
-                else:
-                    file_response = requests.get(
-                        f"{API_BASE_URL}{download_url}", timeout=120
-                    )
-                    if file_response.status_code == 200:
-                        st.session_state["hf_contract_docx_bytes"] = file_response.content
-                        st.session_state["hf_contract_filename"] = payload.get(
-                            "generated_filename", "dogovor.docx"
-                        )
-                        st.success("Договор сформирован — скачайте файл ниже.")
-                    else:
-                        show_api_error(file_response)
-            else:
-                show_api_error(response)
-        except requests.exceptions.ConnectionError:
-            st.error("Не удалось подключиться к FastAPI.")
-        except requests.exceptions.Timeout:
-            st.error(
-                f"Превышено время ожидания (HF ~{_HF_SEC} с). Повторите или увеличьте HF_REQUEST_TIMEOUT_SEC."
-            )
-        except Exception as e:
-            st.error(f"Ошибка: {e}")
-
     docx_bytes = st.session_state.get("hf_contract_docx_bytes")
     if docx_bytes:
         st.download_button(

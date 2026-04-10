@@ -4,7 +4,7 @@ import pytest
 from fastapi import HTTPException
 from starlette.datastructures import UploadFile
 
-import ocr as module
+import tesseract_scan.ocr as module
 
 
 def make_upload_file(

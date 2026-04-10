@@ -1,16 +1,19 @@
+import asyncio
 import io
 from pathlib import Path
+from typing import Callable, ParamSpec, TypeVar
 
 import pytesseract
 from fastapi import APIRouter, HTTPException, UploadFile
 from PIL import Image
-from async_utils import safe_to_thread
 try:
     import fitz  # PyMuPDF
 except Exception:
     fitz = None
 
 router = APIRouter(tags=["ocr"])
+P = ParamSpec("P")
+T = TypeVar("T")
 MAX_FILE_SIZE_BYTES = 1024 * 1024 * 1024  # 1 GB
 OCR_UNSUPPORTED_DETAIL = (
     "Для OCR поддерживаются изображения (PNG, JPG, JPEG) и PDF (первая страница). "
@@ -26,6 +29,17 @@ _BLOCKED_OCR_CONTENT_TYPES = frozenset(
         "text/plain",
     }
 )
+
+
+def _run_sync_guarded(func: Callable[P, T], *args: P.args, **kwargs: P.kwargs) -> T:
+    try:
+        return func(*args, **kwargs)
+    except StopIteration as e:
+        raise RuntimeError("Background sync function raised StopIteration") from e
+
+
+async def safe_to_thread(func: Callable[P, T], *args: P.args, **kwargs: P.kwargs) -> T:
+    return await asyncio.to_thread(_run_sync_guarded, func, *args, **kwargs)
 
 
 def file_too_large_exception() -> HTTPException:

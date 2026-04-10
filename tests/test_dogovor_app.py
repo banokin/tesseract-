@@ -1,6 +1,6 @@
 import pytest
 
-import dogovor
+import huggin_face_scan.dogovor_new as dogovor_new
 
 
 @pytest.fixture
@@ -48,7 +48,7 @@ Email заказчика: ivanov@example.com
 
 
 def test_extract_fields(sample_text):
-    fields = dogovor.extract_fields(sample_text)
+    fields = dogovor_new.extract_fields(sample_text)
 
     assert fields["contract_city"] == "Санкт-Петербург"
     assert fields["contract_number"] == "AB-123/2024"
@@ -59,4 +59,4 @@ def test_extract_fields(sample_text):
 
 def test_resolve_download_path_invalid():
     with pytest.raises(Exception):
-        dogovor._resolve_download_path("../hack.docx")
+        dogovor_new._resolve_download_path("../hack.docx")
