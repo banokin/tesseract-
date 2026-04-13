@@ -124,6 +124,7 @@ class PassportScanTesseractResponse(BaseModel):
 
 
 class PassportRegistrationData(BaseModel):
+    address: str = ""
     region: str = ""
     city: str = ""
     settlement: str = ""
@@ -586,6 +587,7 @@ def normalize_registration_data(payload: Dict[str, Any]) -> PassportRegistration
         return s
 
     return PassportRegistrationData(
+        address=str(payload.get("address", "") or ""),
         region=str(payload.get("region", "") or ""),
         city=str(payload.get("city", "") or ""),
         settlement=str(payload.get("settlement", "") or ""),

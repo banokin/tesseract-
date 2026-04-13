@@ -2,6 +2,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from huggin_face_scan.dogovor_new import router as dogovor_new_router
+from document_tesseract import router as document_tesseract_router
 from huggin_face_scan.scan_passport_hf import router as passport_router
 
 app = FastAPI(
@@ -24,3 +25,4 @@ def root():
 
 app.include_router(dogovor_new_router)
 app.include_router(passport_router)
+app.include_router(document_tesseract_router)
