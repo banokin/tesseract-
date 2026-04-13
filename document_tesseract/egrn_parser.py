@@ -18,6 +18,11 @@ _FIO_LINE = re.compile(
 )
 
 
+def _ocr_pass_chunks(full: str) -> List[str]:
+    chunks = [c.strip() for c in re.split(r"====\s*OCR PASS\s*====", full) if c.strip()]
+    return chunks if chunks else [full]
+
+
 def _norm_space(text: str) -> str:
     return re.sub(r"[ \t]+", " ", text.replace("\r", "\n")).strip()
 
@@ -72,17 +77,28 @@ def _extract_object_type(full: str) -> str:
     )
     if m:
         return m.group(1).strip()
+    for ln in full.split("\n"):
+        line = re.sub(r"\s+", " ", ln).strip(" -:;,.")
+        if len(line) < 4 or len(line) > 100:
+            continue
+        if re.search(
+            r"\b(квартира|помещен\w*|здание|сооружение|машино-место|участок|жилое|нежилое)\b",
+            line,
+            re.I,
+        ):
+            return line[:300]
     return ""
 
 
 def _extract_address(full: str) -> str:
     for pat in (
-        r"(?:адрес|местоположен\w*|место\s+нахожден\w*)\s*(?:объекта)?\s*[:\s]+\s*([^\n]+)",
+        r"(?:адрес|местоположен\w*|место\s+нахожден\w*)\s*(?:объекта)?\s*[:\s]+\s*"
+        r"(.+?)(?=\n\s*(?:площад|кадастров|вид\s+права|правооблад|дата|лист|раздел)\b|$)",
         r"местоположение\s+установлено\s*[:\s]*\s*([^\n]+)",
     ):
-        m = re.search(pat, full, re.I)
+        m = re.search(pat, full, re.I | re.DOTALL)
         if m:
-            return m.group(1).strip()[:500]
+            return re.sub(r"\s+", " ", m.group(1)).strip(" ,.;:")[:500]
     for ln in full.split("\n"):
         line = ln.strip()
         if len(line) < 20 or len(line) > 240:
@@ -110,6 +126,14 @@ def _extract_area(full: str) -> str:
     m = re.search(r"(\d+[.,]\d+)\s*(?:кв|м)", full, re.I)
     if m:
         return m.group(1).replace(",", ".").strip()
+    lines = [ln.strip() for ln in full.split("\n") if ln.strip()]
+    for i, ln in enumerate(lines):
+        if not re.search(r"(площад|общая\s+площад)", ln, re.I):
+            continue
+        window = " ".join(lines[i : min(i + 3, len(lines))])
+        m2 = re.search(r"(\d+[.,]?\d*)\s*(?:кв\.?\s*м|м\s*[²2]|кв\.м\.?)?", window, re.I)
+        if m2:
+            return m2.group(1).replace(",", ".").strip()
     return ""
 
 
@@ -186,12 +210,24 @@ def parse_egrn_ocr_text(ocr_text: str) -> Dict[str, Any]:
     text = _norm_space(ocr_text)
     full = text
 
+    chunks = _ocr_pass_chunks(full)
     cadastral_number = _extract_cadastral(full)
-    object_type = _extract_object_type(full) or _extract_after_label(
-        full, r"объект\s+недвижимости"
-    )
-    address = _extract_address(full)
-    area_sq_m = _extract_area(full)
+    object_candidates: List[str] = []
+    address_candidates: List[str] = []
+    area_candidates: List[str] = []
+    for chunk in chunks:
+        obj = _extract_object_type(chunk) or _extract_after_label(chunk, r"объект\s+недвижимости")
+        addr = _extract_address(chunk)
+        area = _extract_area(chunk)
+        if obj:
+            object_candidates.append(obj)
+        if addr:
+            address_candidates.append(addr)
+        if area:
+            area_candidates.append(area)
+    object_type = max(object_candidates, key=len) if object_candidates else ""
+    address = max(address_candidates, key=len) if address_candidates else ""
+    area_sq_m = max(area_candidates, key=len) if area_candidates else ""
     ownership_type = _extract_ownership(full)
     right_holders = _extract_right_holders(full)
     extract_date = _extract_extract_date(full)
