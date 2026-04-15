@@ -114,6 +114,35 @@ def _serialize_png(image: Image.Image) -> bytes:
     return buffer.getvalue()
 
 
+def preprocess_image_for_ocr(image_bytes: bytes, *, aggressive: bool = False) -> bytes:
+    """
+    Улучшает читаемость фото для OCR без отказа в обработке:
+    - учитывает EXIF-ориентацию;
+    - мягко подавляет шум;
+    - поднимает локальный контраст и резкость.
+    """
+    try:
+        image = Image.open(io.BytesIO(image_bytes))
+        image.load()
+    except Exception:
+        return image_bytes
+
+    image = ImageOps.exif_transpose(image).convert("RGB")
+    # MedianFilter помогает убрать мелкий шум матрицы/сжатия.
+    image = image.filter(ImageFilter.MedianFilter(size=3))
+    gray = ImageOps.grayscale(image)
+    boosted = ImageOps.autocontrast(gray, cutoff=1)
+    contrast = ImageEnhance.Contrast(boosted).enhance(1.15 if aggressive else 1.08)
+    sharpened = contrast.filter(
+        ImageFilter.UnsharpMask(
+            radius=1.6 if aggressive else 1.2,
+            percent=190 if aggressive else 150,
+            threshold=2,
+        )
+    )
+    return _serialize_png(sharpened)
+
+
 def _image_variants_for_ocr(image: Image.Image) -> list[Image.Image]:
     base = image.convert("RGB")
     gray = ImageOps.grayscale(base)
@@ -209,6 +238,8 @@ async def extract_text_from_upload(file: UploadFile) -> str:
         contents = convert_pdf_first_page_to_png(contents)
     elif ext in {".jpg", ".jpeg"} or ct in {"image/jpeg", "image/jpg"}:
         contents = upscale_jpeg_for_ocr(contents, scale=2.5)
+    if ct.startswith("image/") or ext in {".pdf", ".png", ".jpg", ".jpeg", ".webp"}:
+        contents = preprocess_image_for_ocr(contents, aggressive=False)
     try:
         return await safe_to_thread(img_ocr, contents)
     except RuntimeError as e:

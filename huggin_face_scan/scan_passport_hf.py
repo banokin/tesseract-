@@ -15,7 +15,7 @@ from huggingface_hub import InferenceClient
 from PIL import Image, UnidentifiedImageError
 from pydantic import BaseModel, Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
-from tesseract_scan.ocr import extract_text_from_upload
+from tesseract_scan.ocr import extract_text_from_upload, preprocess_image_for_ocr
 
 try:
     import fitz  # PyMuPDF
@@ -1016,6 +1016,7 @@ async def enrich_egrn_fields(egrn_bytes: bytes, current: EgrnExtractData) -> Egr
 
 
 async def run_hf_document_extraction(contents: bytes, prompt: str, max_tokens: int = 700) -> tuple[str, str]:
+    contents = await safe_to_thread(preprocess_image_for_ocr, contents)
     contents = await safe_to_thread(upscale_jpeg_for_ocr, contents, 2.5)
     mime = await safe_to_thread(detect_mime, contents)
 

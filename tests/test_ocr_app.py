@@ -1,8 +1,15 @@
 import io
 import asyncio
 import pytest
+import sys
+import types
 from fastapi import HTTPException
 from starlette.datastructures import UploadFile
+from PIL import Image
+
+pytesseract_stub = types.ModuleType("pytesseract")
+pytesseract_stub.image_to_string = lambda *_args, **_kwargs: ""
+sys.modules.setdefault("pytesseract", pytesseract_stub)
 
 import tesseract_scan.ocr as module
 
@@ -57,3 +64,14 @@ def test_extract_text_from_upload_pdf_converts_first_page(monkeypatch):
     file = make_upload_file("extract.pdf", b"pdf-bytes", "application/pdf")
     result = asyncio.run(module.extract_text_from_upload(file))
     assert result == "ok"
+
+
+def test_preprocess_image_for_ocr_returns_png_bytes():
+    image = Image.new("RGB", (1200, 800), "white")
+    payload = io.BytesIO()
+    image.save(payload, format="JPEG", quality=70)
+
+    processed = module.preprocess_image_for_ocr(payload.getvalue())
+
+    assert isinstance(processed, (bytes, bytearray))
+    assert processed[:8] == b"\x89PNG\r\n\x1a\n"
