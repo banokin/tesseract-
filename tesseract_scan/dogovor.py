@@ -105,6 +105,37 @@ def build_short_fio(full_fio: str) -> str:
     return f"{surname} {initials}".strip()
 
 
+def _uppercase_for_contract(value: str) -> str:
+    return re.sub(r"\s+", " ", str(value or "")).strip().upper()
+
+
+def _normalize_inline_address(value: str) -> str:
+    compact = re.sub(r"\s*,\s*", ", ", re.sub(r"\s+", " ", str(value or "")).strip())
+    if not compact:
+        return ""
+
+    def _is_city_like(part: str) -> bool:
+        return bool(re.match(r"^(г\.|город|пгт|пос\.|с\.|дер\.)\s+", part, re.I))
+
+    def _is_street_like(part: str) -> bool:
+        return bool(re.match(r"^(ул\.|улица|просп\.|проспект|пер\.|переулок|бул\.|бульвар|ш\.|шоссе)\s+", part, re.I))
+
+    def _is_building_like(part: str) -> bool:
+        return bool(re.match(r"^(д\.|дом|кв\.|корп\.|стр\.)\s*", part, re.I))
+
+    parts = [p.strip() for p in compact.split(",") if p.strip()]
+    normalized_parts: list[str] = []
+    for idx, part in enumerate(parts):
+        p = part
+        p = re.sub(r"\bобласть\b", "обл.", p, flags=re.I)
+        p = re.sub(r"^\s*город\s+", "г. ", p, flags=re.I)
+        p = re.sub(r"^\s*улица\s+", "ул. ", p, flags=re.I)
+        if idx == 1 and not _is_city_like(p) and not _is_street_like(p) and not _is_building_like(p):
+            p = f"г. {p}"
+        normalized_parts.append(p)
+    return ", ".join(normalized_parts)
+
+
 def _section_text(text: str, header: str) -> str:
    
     headers = ("исполнитель", "заказчик", "паспорт", "объект")
@@ -232,10 +263,10 @@ def passport_scan_to_contract_data(passport_payload: Mapping[str, Any]) -> Contr
         customer_fio_short=customer_fio_short,
         passport_series=str(data.get("passport_series", "") or ""),
         passport_number=str(data.get("passport_number", "") or ""),
-        passport_issued_by=str(data.get("issuing_authority", "") or ""),
+        passport_issued_by=_uppercase_for_contract(str(data.get("issuing_authority", "") or "")),
         passport_issue_date=str(data.get("issue_date", "") or ""),
         passport_code=str(data.get("department_code", "") or ""),
-        birth_place=str(data.get("birth_place", "") or ""),
+        birth_place=_uppercase_for_contract(str(data.get("birth_place", "") or "")),
         birth_date=str(data.get("birth_date", "") or ""),
     )
 
@@ -267,7 +298,13 @@ def create_doc(contract_data: ContractData, output_path: Path) -> None:
         raise HTTPException(status_code=500, detail="Файл шаблона договора не найден")
 
     doc = DocxTemplate(str(template_path))
-    doc.render(contract_data.model_dump())
+    context = contract_data.model_dump()
+    context["passport_issued_by"] = _uppercase_for_contract(str(context.get("passport_issued_by", "") or ""))
+    context["birth_place"] = _uppercase_for_contract(str(context.get("birth_place", "") or ""))
+    context["customer_registration_address"] = _normalize_inline_address(
+        str(context.get("customer_registration_address", "") or "")
+    )
+    doc.render(context)
     doc.save(str(output_path))
 
 

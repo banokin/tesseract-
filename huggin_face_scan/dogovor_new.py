@@ -113,6 +113,56 @@ def build_short_fio(full_fio: str) -> str:
     return f"{surname} {initials}".strip()
 
 
+def _uppercase_for_contract(value: str) -> str:
+    return re.sub(r"\s+", " ", str(value or "")).strip().upper()
+
+
+def _normalize_inline_address(value: str) -> str:
+    compact = re.sub(r"\s*,\s*", ", ", re.sub(r"\s+", " ", str(value or "")).strip())
+    if not compact:
+        return ""
+
+    def _is_city_like(part: str) -> bool:
+        return bool(re.match(r"^(г\.|город|пгт|пос\.|с\.|дер\.)\s+", part, re.I))
+
+    def _is_street_like(part: str) -> bool:
+        return bool(re.match(r"^(ул\.|улица|просп\.|проспект|пер\.|переулок|бул\.|бульвар|ш\.|шоссе)\s+", part, re.I))
+
+    def _is_building_like(part: str) -> bool:
+        return bool(re.match(r"^(д\.|дом|кв\.|корп\.|стр\.)\s*", part, re.I))
+
+    parts = [p.strip() for p in compact.split(",") if p.strip()]
+    normalized_parts: list[str] = []
+    for idx, part in enumerate(parts):
+        p = part
+        p = re.sub(r"\bобласть\b", "обл.", p, flags=re.I)
+        p = re.sub(r"^\s*город\s+", "г. ", p, flags=re.I)
+        p = re.sub(r"^\s*улица\s+", "ул. ", p, flags=re.I)
+        # В ручном адресе второй сегмент часто приходит как "Оренбург" без префикса.
+        if idx == 1 and not _is_city_like(p) and not _is_street_like(p) and not _is_building_like(p):
+            p = f"г. {p}"
+        normalized_parts.append(p)
+    return ", ".join(normalized_parts)
+
+
+def _with_prefix(value: str, prefixes: tuple[str, ...], default_prefix: str) -> str:
+    normalized = re.sub(r"\s+", " ", str(value or "")).strip().strip(",")
+    if not normalized:
+        return ""
+    if default_prefix == "обл.":
+        normalized = re.sub(r"\bобласть\b", "обл.", normalized, flags=re.I)
+        if re.search(r"(обл\.|респ\.|край|ао)", normalized, re.I):
+            return normalized
+        return f"{normalized} {default_prefix}".strip()
+    if default_prefix == "г.":
+        normalized = re.sub(r"^\s*город\s+", "", normalized, flags=re.I)
+    if default_prefix == "ул.":
+        normalized = re.sub(r"^\s*улица\s+", "", normalized, flags=re.I)
+    if any(re.match(rf"^{re.escape(prefix)}\s+", normalized, re.I) for prefix in prefixes):
+        return normalized
+    return f"{default_prefix} {normalized}"
+
+
 def _section_text(text: str, header: str) -> str:
     headers = ("исполнитель", "заказчик", "паспорт", "объект")
     start_match = re.search(rf"(?im)^\s*{header}(?:\s+\w+)?\s*:?\s*$", text)
@@ -197,10 +247,10 @@ def passport_scan_to_contract_data(passport_payload: Mapping[str, Any]) -> Contr
         customer_fio_short=customer_fio_short,
         passport_series=str(data.get("passport_series", "") or ""),
         passport_number=str(data.get("passport_number", "") or ""),
-        passport_issued_by=str(data.get("issuing_authority", "") or ""),
+        passport_issued_by=_uppercase_for_contract(str(data.get("issuing_authority", "") or "")),
         passport_issue_date=str(data.get("issue_date", "") or ""),
         passport_code=str(data.get("department_code", "") or ""),
-        birth_place=str(data.get("birth_place", "") or ""),
+        birth_place=_uppercase_for_contract(str(data.get("birth_place", "") or "")),
         birth_date=str(data.get("birth_date", "") or ""),
     )
 
@@ -232,6 +282,12 @@ def create_doc(contract_data: ContractData, output_path: Path) -> None:
     context["customer_fio_short"] = customer_fio_short
     # Совместимость с новым шаблоном: customer_fio_abr ожидает сокращенное ФИО.
     context["customer_fio_abr"] = customer_fio_short
+    # Для договора эти поля должны быть в верхнем регистре.
+    context["passport_issued_by"] = _uppercase_for_contract(str(context.get("passport_issued_by", "") or ""))
+    context["birth_place"] = _uppercase_for_contract(str(context.get("birth_place", "") or ""))
+    context["customer_registration_address"] = _normalize_inline_address(
+        str(context.get("customer_registration_address", "") or "")
+    )
     doc.render(context)
     doc.save(str(output_path))
 
@@ -291,10 +347,14 @@ def create_contract_docx_from_passport_json(
 
 def _build_registration_address(reg: Mapping[str, Any]) -> str:
     ordered_parts = [
-        str(reg.get("region", "") or "").strip(),
-        str(reg.get("city", "") or "").strip(),
-        str(reg.get("settlement", "") or "").strip(),
-        str(reg.get("street", "") or "").strip(),
+        _with_prefix(str(reg.get("region", "") or ""), ("обл.", "респ.", "край", "ао"), "обл."),
+        _with_prefix(str(reg.get("city", "") or ""), ("г.",), "г."),
+        _with_prefix(str(reg.get("settlement", "") or ""), ("пгт", "пос.", "с.", "дер."), "пос."),
+        _with_prefix(
+            str(reg.get("street", "") or ""),
+            ("ул.", "просп.", "пер.", "бул.", "ш."),
+            "ул.",
+        ),
     ]
     house = str(reg.get("house", "") or "").strip()
     building = str(reg.get("building", "") or "").strip()
@@ -331,7 +391,7 @@ def unified_json_to_contract_data(payload: Mapping[str, Any]) -> ContractData:
     customer_fio_short = build_short_fio(customer_fio)
 
     override_address = str(payload.get("customer_registration_address_override", "") or "").strip()
-    registration_address = override_address or _build_registration_address(passport_registration)
+    registration_address = _normalize_inline_address(override_address or _build_registration_address(passport_registration))
     ownership_basis = str(payload.get("ownership_basis_document_override", "") or "").strip()
     customer_email = str(payload.get("customer_email_override", "") or "").strip()
     customer_phone = str(payload.get("customer_phone_override", "") or "").strip()
@@ -345,10 +405,10 @@ def unified_json_to_contract_data(payload: Mapping[str, Any]) -> ContractData:
         customer_phone=customer_phone,
         passport_series=str(passport_main.get("passport_series", "") or "").strip(),
         passport_number=str(passport_main.get("passport_number", "") or "").strip(),
-        passport_issued_by=str(passport_main.get("issuing_authority", "") or "").strip(),
+        passport_issued_by=_uppercase_for_contract(str(passport_main.get("issuing_authority", "") or "").strip()),
         passport_issue_date=str(passport_main.get("issue_date", "") or "").strip(),
         passport_code=str(passport_main.get("department_code", "") or "").strip(),
-        birth_place=str(passport_main.get("birth_place", "") or "").strip(),
+        birth_place=_uppercase_for_contract(str(passport_main.get("birth_place", "") or "").strip()),
         birth_date=str(passport_main.get("birth_date", "") or "").strip(),
         property_name=str(egrn_extract.get("object_type", "") or "").strip(),
         property_purpose=str(egrn_extract.get("ownership_type", "") or "").strip(),
