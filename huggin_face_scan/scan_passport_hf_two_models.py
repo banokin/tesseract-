@@ -57,6 +57,7 @@ class TwoModelsUnifiedResponse(BaseModel):
     needs_review: bool
     extracted_numbers: Dict[str, Dict[str, str]]
     recommended_passport_number: Dict[str, str]
+    passport_registration_validation: Dict[str, Any]
     extraction_debug: Dict[str, str]
 
 
@@ -315,6 +316,124 @@ def _validate_passport_series_number_no_raise(raw_text: str, model_name: str) ->
         return series, number
     except HTTPException:
         return None, None
+
+
+def _passport_full(series: str | None, number: str | None) -> str:
+    return f"{series or ''}{number or ''}"
+
+
+def _is_valid_passport_full(full: str) -> bool:
+    return len(full) == 10 and full not in {
+        "0000000000",
+        "1111111111",
+        "1234567890",
+        "0123456789",
+        "9999999999",
+    }
+
+
+def _extract_registration_passport_from_ocr(ocr_text: str) -> tuple[str | None, str | None, str]:
+    if not ocr_text.strip():
+        return None, None, "ocr_empty"
+    try:
+        parsed = parse_passport_ocr_text(ocr_text)
+    except Exception:
+        parsed = {}
+    series = _sanitize_passport_digits(str(parsed.get("passport_series", "") or ""))[:4]
+    number = _sanitize_passport_digits(str(parsed.get("passport_number", "") or ""))[:6]
+    if _is_valid_passport_full(_passport_full(series, number)):
+        return series, number, "ocr_parser"
+    return None, None, "ocr_not_found"
+
+
+async def _extract_registration_passport_number(
+    registration_bytes: bytes,
+    registration_ocr_text: str,
+    model_name: str,
+) -> tuple[str | None, str | None, str]:
+    ocr_series, ocr_number, ocr_source = _extract_registration_passport_from_ocr(registration_ocr_text)
+    if ocr_series and ocr_number:
+        return ocr_series, ocr_number, ocr_source
+
+    prompt = _prompt_with_ocr_context(
+        (
+            "На изображении страницы прописки паспорта РФ найди серию и номер паспорта, "
+            "к которому относится эта страница. Нужно вернуть ровно 10 цифр: 4 цифры серии и 6 цифр номера. "
+            "Верни строго JSON без пояснений:\n"
+            '{"series":"1234","number":"567890"}\n'
+            "Если серия/номер на странице не видны, верни:\n"
+            '{"series":null,"number":null}'
+        ),
+        registration_ocr_text,
+        "страница регистрации паспорта РФ",
+    )
+    try:
+        raw_text, _ = await run_hf_document_extraction(
+            registration_bytes,
+            prompt,
+            max_tokens=120,
+            model_name=model_name,
+        )
+    except Exception:
+        return None, None, f"{ocr_source}+vlm_error"
+
+    series, number = _validate_passport_series_number_no_raise(raw_text, model_name)
+    if series and number:
+        return series, number, f"{ocr_source}+vlm"
+    return None, None, f"{ocr_source}+vlm_not_found"
+
+
+def _build_registration_validation(
+    main_full: str,
+    registration_candidates: Dict[str, str],
+) -> Dict[str, Any]:
+    valid_candidates = {
+        source: full
+        for source, full in registration_candidates.items()
+        if _is_valid_passport_full(full)
+    }
+    main = {
+        "series": main_full[:4] if len(main_full) == 10 else "",
+        "number": main_full[4:10] if len(main_full) == 10 else "",
+        "full": main_full if len(main_full) == 10 else "",
+    }
+    if not _is_valid_passport_full(main_full):
+        return {
+            "status": "main_not_found",
+            "main": main,
+            "registration": {"series": "", "number": "", "full": ""},
+            "sources": registration_candidates,
+            "message": "Не удалось надежно определить серию/номер на основной странице.",
+        }
+
+    for source, full in valid_candidates.items():
+        if full == main_full:
+            return {
+                "status": "match",
+                "main": main,
+                "registration": {"series": full[:4], "number": full[4:10], "full": full},
+                "sources": valid_candidates,
+                "source": source,
+                "message": "Серия и номер на основной странице и странице прописки совпадают.",
+            }
+
+    if valid_candidates:
+        full, _ = Counter(valid_candidates.values()).most_common(1)[0]
+        return {
+            "status": "mismatch",
+            "main": main,
+            "registration": {"series": full[:4], "number": full[4:10], "full": full},
+            "sources": valid_candidates,
+            "message": "Серия/номер на странице прописки не совпадают с основной страницей.",
+        }
+
+    return {
+        "status": "not_found",
+        "main": main,
+        "registration": {"series": "", "number": "", "full": ""},
+        "sources": registration_candidates,
+        "message": "Не удалось найти серию/номер на странице прописки для проверки совпадения.",
+    }
 
 
 async def _extract_series_and_number(
@@ -633,17 +752,61 @@ async def scan_documents_unified_two_models(
         tesseract_full=tesseract_full,
     )
     recommended = {"series": "", "number": ""}
+    winner_full = ""
     if not needs_review:
         full_values = [value.get("full", "") for value in extracted_numbers.values() if value.get("full", "")]
         winner_full = Counter(full_values).most_common(1)[0][0] if full_values else ""
         if len(winner_full) == 10:
             recommended = {"series": winner_full[:4], "number": winner_full[4:10]}
+
+    (reg_qwen_series, reg_qwen_number, reg_qwen_source), (
+        reg_llama_series,
+        reg_llama_number,
+        reg_llama_source,
+    ) = await asyncio.gather(
+        _extract_registration_passport_number(registration_ocr_bytes, registration_ocr_text, QWEN_30_MODEL),
+        _extract_registration_passport_number(
+            registration_ocr_bytes,
+            registration_ocr_text,
+            LLAMA_4_SCOUT_MODEL,
+        ),
+    )
+    registration_candidates: Dict[str, str] = {}
+    reg_qwen_full = _passport_full(reg_qwen_series, reg_qwen_number)
+    reg_llama_full = _passport_full(reg_llama_series, reg_llama_number)
+    if _is_valid_passport_full(reg_qwen_full):
+        registration_candidates[f"qwen30_registration:{reg_qwen_source}"] = reg_qwen_full
+    if _is_valid_passport_full(reg_llama_full):
+        registration_candidates[f"llama4scout_registration:{reg_llama_source}"] = reg_llama_full
+
+    main_full_for_validation = _passport_full(recommended.get("series"), recommended.get("number"))
+    if not _is_valid_passport_full(main_full_for_validation):
+        main_full_for_validation = winner_full
+    if not _is_valid_passport_full(main_full_for_validation):
+        full_values = [value.get("full", "") for value in extracted_numbers.values() if value.get("full", "")]
+        main_full_for_validation = Counter(full_values).most_common(1)[0][0] if full_values else ""
+
+    passport_registration_validation = _build_registration_validation(
+        main_full_for_validation,
+        registration_candidates,
+    )
+    if passport_registration_validation.get("status") != "match":
+        needs_review = True
+    reg_validation_full = str(passport_registration_validation.get("registration", {}).get("full", ""))
+    if _is_valid_passport_full(reg_validation_full):
+        extracted_numbers["passport_registration"] = {
+            "series": reg_validation_full[:4],
+            "number": reg_validation_full[4:10],
+            "full": reg_validation_full,
+        }
+
     debug = {
         "tesseract_used": "yes" if any([passport_ocr_text, registration_ocr_text, egrn_ocr_text]) else "no",
         "tesseract_passport_number_used": "yes" if tesseract_full else "no",
         "passport_ocr_chars": str(len(passport_ocr_text)),
         "registration_ocr_chars": str(len(registration_ocr_text)),
         "egrn_ocr_chars": str(len(egrn_ocr_text)),
+        "passport_registration_validation": str(passport_registration_validation.get("status", "")),
     }
 
     return TwoModelsUnifiedResponse(
@@ -657,5 +820,6 @@ async def scan_documents_unified_two_models(
         needs_review=needs_review,
         extracted_numbers=extracted_numbers,
         recommended_passport_number=recommended,
+        passport_registration_validation=passport_registration_validation,
         extraction_debug=debug,
     )
