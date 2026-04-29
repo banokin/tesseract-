@@ -4,16 +4,20 @@ import asyncio
 import json
 import re
 from collections import Counter
-from typing import Dict
+from typing import Any, Dict
 
 from fastapi import APIRouter, File, HTTPException, UploadFile
 from pydantic import BaseModel
 
+from document_tesseract.egrn_parser import parse_egrn_ocr_text
+from document_tesseract.passport_parser import parse_passport_ocr_text
+from document_tesseract.registration_parser import parse_registration_ocr_text
 from huggin_face_scan.model_config import LLAMA_4_SCOUT_MODEL, QWEN_30_MODEL, TWO_MODELS_MAP
 from huggin_face_scan.scan_passport_hf import (
     UnifiedDocumentsData,
     UnifiedDocumentsScanResponse,
     build_egrn_prompt,
+    build_prompt as build_passport_prompt,
     build_registration_prompt,
     enrich_egrn_fields,
     enrich_passport_fields,
@@ -25,10 +29,10 @@ from huggin_face_scan.scan_passport_hf import (
     normalize_registration_data,
     pdf_first_page_to_png,
     run_hf_document_extraction,
-    run_hf_passport_extraction,
     safe_to_thread,
     validate_image,
 )
+from tesseract_scan.ocr import img_ocr_multi_pass
 
 router = APIRouter(tags=["passport-two-models"])
 
@@ -61,6 +65,54 @@ async def _prepare_ocr_bytes(raw: bytes, content_type: str) -> bytes:
         return await safe_to_thread(pdf_first_page_to_png, raw)
     await safe_to_thread(validate_image, raw)
     return raw
+
+
+def _truncate_ocr_context(text: str, max_chars: int = 5000) -> str:
+    text = re.sub(r"\n{3,}", "\n\n", (text or "").strip())
+    if len(text) <= max_chars:
+        return text
+    return f"{text[:max_chars]}\n\n[OCR truncated: {len(text) - max_chars} chars omitted]"
+
+
+def _prompt_with_ocr_context(prompt: str, ocr_text: str, document_name: str) -> str:
+    if not ocr_text.strip():
+        return prompt
+    return (
+        f"{prompt}\n\n"
+        f"Ниже шумный OCR-текст документа «{document_name}». "
+        "Используй его как подсказку для букв, дат и номеров, но главным источником считай изображение. "
+        "Не придумывай значения, если их нет ни на изображении, ни в OCR. Верни только JSON по исходной схеме.\n"
+        "OCR_TEXT_BEGIN\n"
+        f"{_truncate_ocr_context(ocr_text)}\n"
+        "OCR_TEXT_END"
+    )
+
+
+async def _extract_ocr_text(contents: bytes, *, include_crops: bool = True) -> str:
+    try:
+        return await safe_to_thread(img_ocr_multi_pass, contents, include_crops=include_crops)
+    except Exception:
+        return ""
+
+
+def _is_empty_ocr_value(value: Any) -> bool:
+    if value is None:
+        return True
+    if isinstance(value, str):
+        return not value.strip()
+    if isinstance(value, list):
+        return len(value) == 0
+    return False
+
+
+def _merge_model_with_ocr(model_payload: dict[str, Any], ocr_payload: dict[str, Any]) -> dict[str, Any]:
+    merged = dict(model_payload)
+    for key, ocr_value in ocr_payload.items():
+        if _is_empty_ocr_value(ocr_value):
+            continue
+        if key not in merged or _is_empty_ocr_value(merged.get(key)):
+            merged[key] = ocr_value
+    return merged
 
 
 def _order_quad_points(points: "np.ndarray") -> "np.ndarray":
@@ -336,6 +388,9 @@ async def _scan_with_model(
     main_ocr_bytes: bytes,
     registration_ocr_bytes: bytes,
     egrn_ocr_bytes: bytes,
+    passport_ocr_text: str,
+    registration_ocr_text: str,
+    egrn_ocr_text: str,
     model_name: str,
 ) -> UnifiedDocumentsScanResponse:
     try:
@@ -344,16 +399,25 @@ async def _scan_with_model(
             (registration_raw, _),
             (egrn_raw, _),
         ) = await asyncio.gather(
-            run_hf_passport_extraction(main_ocr_bytes, model_name=model_name),
+            run_hf_document_extraction(
+                main_ocr_bytes,
+                _prompt_with_ocr_context(build_passport_prompt(), passport_ocr_text, "паспорт РФ"),
+                max_tokens=700,
+                model_name=model_name,
+            ),
             run_hf_document_extraction(
                 registration_ocr_bytes,
-                build_registration_prompt(),
+                _prompt_with_ocr_context(
+                    build_registration_prompt(),
+                    registration_ocr_text,
+                    "страница регистрации паспорта РФ",
+                ),
                 max_tokens=600,
                 model_name=model_name,
             ),
             run_hf_document_extraction(
                 egrn_ocr_bytes,
-                build_egrn_prompt(),
+                _prompt_with_ocr_context(build_egrn_prompt(), egrn_ocr_text, "выписка ЕГРН"),
                 max_tokens=700,
                 model_name=model_name,
             ),
@@ -373,7 +437,11 @@ async def _scan_with_model(
     )
 
     try:
-        passport_data = normalize_passport_data(extract_json_from_text(passport_raw))
+        passport_payload = extract_json_from_text(passport_raw)
+        passport_ocr_payload = parse_passport_ocr_text(passport_ocr_text) if passport_ocr_text else {}
+        passport_data = normalize_passport_data(
+            _merge_model_with_ocr(passport_payload, passport_ocr_payload)
+        )
     except Exception as e:
         raise HTTPException(
             status_code=500,
@@ -381,7 +449,13 @@ async def _scan_with_model(
         ) from e
 
     try:
-        registration_data = normalize_registration_data(extract_generic_json_from_text(registration_raw))
+        registration_payload = extract_generic_json_from_text(registration_raw)
+        registration_ocr_payload = (
+            parse_registration_ocr_text(registration_ocr_text) if registration_ocr_text else {}
+        )
+        registration_data = normalize_registration_data(
+            _merge_model_with_ocr(registration_payload, registration_ocr_payload)
+        )
     except Exception as e:
         raise HTTPException(
             status_code=500,
@@ -389,7 +463,9 @@ async def _scan_with_model(
         ) from e
 
     try:
-        egrn_data = normalize_egrn_data(extract_generic_json_from_text(egrn_raw))
+        egrn_payload = extract_generic_json_from_text(egrn_raw)
+        egrn_ocr_payload = parse_egrn_ocr_text(egrn_ocr_text) if egrn_ocr_text else {}
+        egrn_data = normalize_egrn_data(_merge_model_with_ocr(egrn_payload, egrn_ocr_payload))
     except Exception as e:
         raise HTTPException(
             status_code=500,
@@ -420,9 +496,14 @@ async def _scan_with_model(
             egrn_extract=egrn_data,
         ),
         raw_text={
-            "passport_main": f"{passport_raw}\n\n--- strict_series_number_pass ---\n{strict_passport_raw}",
-            "passport_registration": registration_raw,
-            "egrn_extract": egrn_raw,
+            "passport_main": (
+                f"{passport_raw}\n\n--- strict_series_number_pass ---\n{strict_passport_raw}"
+                f"\n\n--- tesseract_ocr_context ---\n{passport_ocr_text}"
+            ),
+            "passport_registration": (
+                f"{registration_raw}\n\n--- tesseract_ocr_context ---\n{registration_ocr_text}"
+            ),
+            "egrn_extract": f"{egrn_raw}\n\n--- tesseract_ocr_context ---\n{egrn_ocr_text}",
         },
     )
 
@@ -519,9 +600,31 @@ async def scan_documents_unified_two_models(
         _prepare_ocr_bytes(egrn_bytes, egrn_type),
     )
 
+    passport_ocr_text, registration_ocr_text, egrn_ocr_text = await asyncio.gather(
+        _extract_ocr_text(main_ocr_bytes, include_crops=True),
+        _extract_ocr_text(registration_ocr_bytes, include_crops=True),
+        _extract_ocr_text(egrn_ocr_bytes, include_crops=True),
+    )
+
     qwen_result, llama_result = await asyncio.gather(
-        _scan_with_model(main_ocr_bytes, registration_ocr_bytes, egrn_ocr_bytes, QWEN_30_MODEL),
-        _scan_with_model(main_ocr_bytes, registration_ocr_bytes, egrn_ocr_bytes, LLAMA_4_SCOUT_MODEL),
+        _scan_with_model(
+            main_ocr_bytes,
+            registration_ocr_bytes,
+            egrn_ocr_bytes,
+            passport_ocr_text,
+            registration_ocr_text,
+            egrn_ocr_text,
+            QWEN_30_MODEL,
+        ),
+        _scan_with_model(
+            main_ocr_bytes,
+            registration_ocr_bytes,
+            egrn_ocr_bytes,
+            passport_ocr_text,
+            registration_ocr_text,
+            egrn_ocr_text,
+            LLAMA_4_SCOUT_MODEL,
+        ),
     )
     tesseract_full = await safe_to_thread(_extract_with_tesseract, main_ocr_bytes)
     passport_number_consensus, needs_review, extracted_numbers = _build_consensus_payload(
@@ -535,7 +638,13 @@ async def scan_documents_unified_two_models(
         winner_full = Counter(full_values).most_common(1)[0][0] if full_values else ""
         if len(winner_full) == 10:
             recommended = {"series": winner_full[:4], "number": winner_full[4:10]}
-    debug = {"tesseract_used": "yes" if tesseract_full else "no"}
+    debug = {
+        "tesseract_used": "yes" if any([passport_ocr_text, registration_ocr_text, egrn_ocr_text]) else "no",
+        "tesseract_passport_number_used": "yes" if tesseract_full else "no",
+        "passport_ocr_chars": str(len(passport_ocr_text)),
+        "registration_ocr_chars": str(len(registration_ocr_text)),
+        "egrn_ocr_chars": str(len(egrn_ocr_text)),
+    }
 
     return TwoModelsUnifiedResponse(
         ok=True,
