@@ -78,43 +78,6 @@ def _preprocess_for_passport_number(contents: bytes) -> bytes:
     if cv2 is None or np is None:
         return contents
 
-
-def _build_passport_number_variants(contents: bytes) -> list[bytes]:
-    if cv2 is None or np is None:
-        return [contents]
-
-    arr = np.frombuffer(contents, np.uint8)
-    image = cv2.imdecode(arr, cv2.IMREAD_GRAYSCALE)
-    if image is None:
-        return [contents]
-
-    h, w = image.shape[:2]
-    crops: dict[str, "np.ndarray"] = {
-        "right_vertical": image[int(h * 0.05) : int(h * 0.95), int(w * 0.78) : int(w * 0.98)],
-        "bottom_right": image[int(h * 0.45) : h, int(w * 0.45) : w],
-        "top_right": image[int(h * 0.02) : int(h * 0.25), int(w * 0.55) : w],
-        "full": image,
-    }
-
-    variants: list[bytes] = []
-    for crop in crops.values():
-        if crop.size == 0:
-            continue
-        rotated_variants = [
-            crop,
-            cv2.rotate(crop, cv2.ROTATE_90_CLOCKWISE),
-            cv2.rotate(crop, cv2.ROTATE_90_COUNTERCLOCKWISE),
-            cv2.rotate(crop, cv2.ROTATE_180),
-        ]
-        for variant in rotated_variants:
-            upscaled = cv2.resize(variant, None, fx=1.8, fy=1.8, interpolation=cv2.INTER_CUBIC)
-            _, binarized = cv2.threshold(upscaled, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-            ok, encoded = cv2.imencode(".jpg", binarized)
-            if ok:
-                variants.append(encoded.tobytes())
-
-    return variants or [contents]
-
     arr = np.frombuffer(contents, np.uint8)
     image = cv2.imdecode(arr, cv2.IMREAD_COLOR)
     if image is None:
@@ -171,20 +134,61 @@ def _build_passport_number_variants(contents: bytes) -> list[bytes]:
                     gray = cv2.warpPerspective(gray, matrix, (max_w, max_h))
                 break
 
-        # Crop bottom-right region where passport number is typically located.
-        h, w = gray.shape[:2]
-        y1 = int(h * 0.45)
-        x1 = int(w * 0.45)
-        roi = gray[y1:h, x1:w]
-        if roi.size == 0:
-            roi = gray
-
-        upscaled = cv2.resize(roi, None, fx=1.8, fy=1.8, interpolation=cv2.INTER_CUBIC)
-        _, final = cv2.threshold(upscaled, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-        ok, encoded = cv2.imencode(".jpg", final)
+        ok, encoded = cv2.imencode(".jpg", gray)
         return encoded.tobytes() if ok else contents
     except Exception:
         return contents
+
+
+def _make_rotation_variants(crop: "np.ndarray") -> dict[str, "np.ndarray"]:
+    return {
+        "original": crop,
+        "rotate_90_clockwise": cv2.rotate(crop, cv2.ROTATE_90_CLOCKWISE),
+        "rotate_90_counterclockwise": cv2.rotate(crop, cv2.ROTATE_90_COUNTERCLOCKWISE),
+        "rotate_180": cv2.rotate(crop, cv2.ROTATE_180),
+    }
+
+
+def _preprocess_number_crop(rotated_crop: "np.ndarray") -> bytes | None:
+    if rotated_crop.size == 0:
+        return None
+    upscaled = cv2.resize(rotated_crop, None, fx=2.2, fy=2.2, interpolation=cv2.INTER_CUBIC)
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+    contrasted = clahe.apply(upscaled)
+    _, binarized = cv2.threshold(contrasted, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    ok, encoded = cv2.imencode(".jpg", binarized)
+    return encoded.tobytes() if ok else None
+
+
+def _build_passport_number_variants(contents: bytes) -> list[tuple[str, bytes]]:
+    if cv2 is None or np is None:
+        return [("original", contents)]
+
+    arr = np.frombuffer(contents, np.uint8)
+    image = cv2.imdecode(arr, cv2.IMREAD_GRAYSCALE)
+    if image is None:
+        return [("original", contents)]
+
+    h, w = image.shape[:2]
+    crops: dict[str, "np.ndarray"] = {
+        "right_vertical": image[int(h * 0.05) : int(h * 0.95), int(w * 0.78) : int(w * 0.98)],
+        "left_vertical": image[int(h * 0.05) : int(h * 0.95), int(w * 0.02) : int(w * 0.22)],
+        "bottom_right": image[int(h * 0.45) : h, int(w * 0.45) : w],
+        "top_right": image[int(h * 0.02) : int(h * 0.25), int(w * 0.55) : w],
+        "full": image,
+    }
+
+    variants: list[tuple[str, bytes]] = []
+    for crop_name, crop in crops.items():
+        if crop.size == 0:
+            continue
+        # Rotate the raw crop first; OCR/VLM reads horizontal digits more reliably after that.
+        for rotation_name, rotated_crop in _make_rotation_variants(crop).items():
+            encoded = _preprocess_number_crop(rotated_crop)
+            if encoded is not None:
+                variants.append((f"{crop_name}:{rotation_name}", encoded))
+
+    return variants or [("original", contents)]
 
 
 def _sanitize_passport_digits(raw_value: str) -> str:
@@ -291,7 +295,7 @@ async def _extract_series_and_number(
     ]
     last_error: HTTPException | None = None
     for prompt_idx, prompt in enumerate(prompts):
-        for variant_idx, variant in enumerate(variants):
+        for variant_idx, (variant_name, variant) in enumerate(variants):
             raw_text, _ = await run_hf_document_extraction(
                 variant,
                 prompt,
@@ -300,7 +304,7 @@ async def _extract_series_and_number(
             )
             try:
                 series, number = _validate_passport_series_number(raw_text, model_name)
-                debug = f"success prompt={prompt_idx} variant={variant_idx}"
+                debug = f"success prompt={prompt_idx} variant={variant_idx} {variant_name}"
                 return series, number, f"{debug}\n{raw_text}"
             except HTTPException as e:
                 if e.status_code == 422:
