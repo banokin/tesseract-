@@ -10,7 +10,7 @@ import re
 from io import BytesIO
 from typing import Any, Callable, Dict, List, ParamSpec, TypeVar
 
-from fastapi import APIRouter, File, HTTPException, UploadFile
+from fastapi import APIRouter, File, Form, HTTPException, UploadFile
 from huggingface_hub import InferenceClient
 from PIL import Image, UnidentifiedImageError
 from pydantic import BaseModel, Field, field_validator
@@ -923,7 +923,9 @@ def build_egrn_focus_prompt(fields: List[str]) -> str:
     )
 
 
-async def enrich_passport_fields(contents: bytes, current: PassportData) -> PassportData:
+async def enrich_passport_fields(
+    contents: bytes, current: PassportData, model_name: str | None = None
+) -> PassportData:
     fields = _passport_missing_or_invalid_fields(current)
     if not fields:
         return current
@@ -933,6 +935,7 @@ async def enrich_passport_fields(contents: bytes, current: PassportData) -> Pass
             contents,
             build_passport_focus_prompt(fields),
             max_tokens=350,
+            model_name=model_name,
         )
         focused_payload = extract_json_from_text(focused_raw)
         focused = normalize_passport_data(focused_payload)
@@ -957,7 +960,7 @@ async def enrich_passport_fields(contents: bytes, current: PassportData) -> Pass
 
 
 async def enrich_registration_fields(
-    contents: bytes, current: PassportRegistrationData
+    contents: bytes, current: PassportRegistrationData, model_name: str | None = None
 ) -> PassportRegistrationData:
     fields = _registration_missing_or_invalid_fields(current)
     if not fields:
@@ -967,6 +970,7 @@ async def enrich_registration_fields(
             contents,
             build_registration_focus_prompt(fields),
             max_tokens=300,
+            model_name=model_name,
         )
         focused_payload = extract_generic_json_from_text(focused_raw)
         focused = normalize_registration_data(focused_payload)
@@ -987,7 +991,9 @@ async def enrich_registration_fields(
     return merged
 
 
-async def enrich_egrn_fields(egrn_bytes: bytes, current: EgrnExtractData) -> EgrnExtractData:
+async def enrich_egrn_fields(
+    egrn_bytes: bytes, current: EgrnExtractData, model_name: str | None = None
+) -> EgrnExtractData:
     fields = _egrn_missing_or_invalid_fields(current)
     if not fields:
         return current
@@ -996,6 +1002,7 @@ async def enrich_egrn_fields(egrn_bytes: bytes, current: EgrnExtractData) -> Egr
             egrn_bytes,
             build_egrn_focus_prompt(fields),
             max_tokens=350,
+            model_name=model_name,
         )
         focused_payload = extract_generic_json_from_text(focused_raw)
         focused = normalize_egrn_data(focused_payload)
@@ -1015,7 +1022,12 @@ async def enrich_egrn_fields(egrn_bytes: bytes, current: EgrnExtractData) -> Egr
     return merged
 
 
-async def run_hf_document_extraction(contents: bytes, prompt: str, max_tokens: int = 700) -> tuple[str, str]:
+async def run_hf_document_extraction(
+    contents: bytes,
+    prompt: str,
+    max_tokens: int = 700,
+    model_name: str | None = None,
+) -> tuple[str, str]:
     contents = await safe_to_thread(preprocess_image_for_ocr, contents)
     contents = await safe_to_thread(upscale_jpeg_for_ocr, contents, 2.5)
     mime = await safe_to_thread(detect_mime, contents)
@@ -1048,7 +1060,7 @@ async def run_hf_document_extraction(contents: bytes, prompt: str, max_tokens: i
         return _message_content_to_str(raw)
 
     def _sync_chat_completion() -> tuple[Any, str]:
-        primary = settings.hf_model
+        primary = (model_name or settings.hf_model).strip()
         completion, used = _chat_completion_for_model(primary), primary
 
         if not _text_from_completion(completion):
@@ -1081,7 +1093,7 @@ async def run_hf_document_extraction(contents: bytes, prompt: str, max_tokens: i
                 "HF passport extraction attempt failed",
                 extra={
                     "attempt": attempt + 1,
-                    "model": settings.hf_model,
+                    "model": model_name or settings.hf_model,
                     "error_repr": repr(e),
                     "cause_repr": repr(e.__cause__) if e.__cause__ else None,
                 },
@@ -1097,7 +1109,7 @@ async def run_hf_document_extraction(contents: bytes, prompt: str, max_tokens: i
             "или используйте режим Tesseract. "
             f"Техническая ошибка: {tech_error} "
             f"Причина: {tech_cause}; "
-            f"модель: {settings.hf_model}; "
+            f"модель: {model_name or settings.hf_model}; "
             f"таймаут HTTP: {settings.hf_request_timeout_sec} с."
         )
         logger.error("HF: все попытки исчерпаны: %s", detail)
@@ -1116,8 +1128,15 @@ async def run_hf_document_extraction(contents: bytes, prompt: str, max_tokens: i
         )
 
 
-async def run_hf_passport_extraction(contents: bytes) -> tuple[str, str]:
-    return await run_hf_document_extraction(contents, build_prompt(), max_tokens=700)
+async def run_hf_passport_extraction(
+    contents: bytes, model_name: str | None = None
+) -> tuple[str, str]:
+    return await run_hf_document_extraction(
+        contents,
+        build_prompt(),
+        max_tokens=700,
+        model_name=model_name,
+    )
 
 
 @router.post("/scan-passport", response_model=PassportScanResponse)
@@ -1171,6 +1190,7 @@ async def scan_documents_unified(
     passport_main: UploadFile = File(...),
     passport_registration: UploadFile = File(...),
     egrn_extract: UploadFile = File(...),
+    hf_model: str | None = Form(default=None),
 ) -> UnifiedDocumentsScanResponse:
     main_type = (passport_main.content_type or "").lower()
     reg_type = (passport_registration.content_type or "").lower()
@@ -1207,16 +1227,18 @@ async def scan_documents_unified(
             (registration_raw, _),
             (egrn_raw, _),
         ) = await asyncio.gather(
-            run_hf_passport_extraction(main_ocr_bytes),
+            run_hf_passport_extraction(main_ocr_bytes, model_name=hf_model),
             run_hf_document_extraction(
                 registration_ocr_bytes,
                 build_registration_prompt(),
                 max_tokens=600,
+                model_name=hf_model,
             ),
             run_hf_document_extraction(
                 egrn_ocr_bytes,
                 build_egrn_prompt(),
                 max_tokens=700,
+                model_name=hf_model,
             ),
         )
     except HTTPException:
@@ -1255,9 +1277,9 @@ async def scan_documents_unified(
         ) from e
 
     passport_data, registration_data, egrn_data = await asyncio.gather(
-        enrich_passport_fields(main_ocr_bytes, passport_data),
-        enrich_registration_fields(registration_ocr_bytes, registration_data),
-        enrich_egrn_fields(egrn_ocr_bytes, egrn_data),
+        enrich_passport_fields(main_ocr_bytes, passport_data, model_name=hf_model),
+        enrich_registration_fields(registration_ocr_bytes, registration_data, model_name=hf_model),
+        enrich_egrn_fields(egrn_ocr_bytes, egrn_data, model_name=hf_model),
     )
 
     return UnifiedDocumentsScanResponse(
