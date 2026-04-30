@@ -297,7 +297,9 @@ async def scan_documents_russian_docs_two_models(
     )
     passport_data = normalize_passport_data(_normalize_russian_docs_passport(main_raw.get("ocr")))
     passport_raw_debug = f"{_compact_raw_payload(main_raw)}\n\n--- russian_docs_ocr_text ---\n{main_text}"
-    ai_validation = await _validate_passport_words_with_ai(passport_data, passport_raw_debug, scan_id)
+    ai_validation_task = asyncio.create_task(
+        _validate_passport_words_with_ai(passport_data, passport_raw_debug, scan_id)
+    )
 
     registration_ocr_bytes, egrn_ocr_bytes = await asyncio.gather(
         _prepare_two_models_ocr_bytes(registration_bytes, reg_type),
@@ -328,6 +330,7 @@ async def scan_documents_russian_docs_two_models(
     )
 
     registration_data, egrn_data, two_models_raw, models_used = _pick_best_result([qwen_result, llama_result])
+    ai_validation = await ai_validation_task
     _clear_invalid_registration_address(registration_data)
     _clear_invalid_egrn_data(egrn_data, passport_data, source_is_passport=False)
     _log(
