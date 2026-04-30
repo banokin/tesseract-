@@ -7,6 +7,7 @@
 #
 # ONNX is the recommended default for local CPU experiments.
 onnxruntime==1.18.1
+scikit-learn==1.5.1
 
 # Needed only if you select OpenVINO on the frontend page.
 openvino==2026.1.0
