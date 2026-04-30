@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import importlib
+import json
 import logging
+import re
 import tempfile
 from pathlib import Path
 from typing import Any
@@ -61,6 +63,49 @@ def _pipeline_result_to_dict(result: Any) -> dict[str, Any]:
     return out
 
 
+def _pick_ocr_value(ocr: dict[str, Any], *keys: str) -> str:
+    for key in keys:
+        value = ocr.get(key)
+        if value is None:
+            continue
+        if isinstance(value, str):
+            return value.strip()
+        if isinstance(value, list):
+            return " ".join(str(item).strip() for item in value if str(item).strip())
+        if isinstance(value, dict):
+            inner = value.get("ocr")
+            if isinstance(inner, list):
+                return " ".join(str(item).strip() for item in inner if str(item).strip())
+            if isinstance(inner, str):
+                return inner.strip()
+    return ""
+
+
+def _split_russian_docs_licence_number(value: str) -> tuple[str, str]:
+    digits = re.sub(r"\D", "", value or "")
+    if len(digits) < 10:
+        return "", ""
+    return digits[:4], digits[4:10]
+
+
+def _compact_raw_payload(raw: dict[str, Any]) -> str:
+    """Keep debug OCR values, but avoid serializing image arrays returned by RussianDocsOCR."""
+    payload = {
+        "ocr": raw.get("ocr") if isinstance(raw.get("ocr"), dict) else None,
+        "doctype": raw.get("doctype"),
+        "quality": raw.get("quality") if isinstance(raw.get("quality"), dict) else {},
+    }
+    text_fields = raw.get("text_fields")
+    if isinstance(text_fields, tuple) and text_fields:
+        payload["text_fields_count"] = len(text_fields[0]) if isinstance(text_fields[0], list) else 0
+    elif isinstance(text_fields, list):
+        payload["text_fields_count"] = len(text_fields)
+    words_patches = raw.get("words_patches")
+    if isinstance(words_patches, dict):
+        payload["words_patch_fields"] = sorted(words_patches.keys())
+    return json.dumps(payload, ensure_ascii=False, indent=2)
+
+
 def _run_russian_docs_ocr(
     image_path: Path,
     *,
@@ -95,18 +140,32 @@ def _run_russian_docs_ocr(
 def _normalize_russian_docs_passport(ocr: dict[str, Any] | None) -> dict[str, str]:
     if not isinstance(ocr, dict):
         return {"confidence_note": "RussianDocsOCR не вернул ocr-словарь."}
+    licence_number = _pick_ocr_value(ocr, "Licence_number", "License_number", "licence_number", "license_number")
+    passport_series, passport_number = _split_russian_docs_licence_number(licence_number)
     return {
-        "issuing_authority": str(ocr.get("issuing_authority", "") or ocr.get("issued_by", "") or ""),
-        "issue_date": str(ocr.get("issue_date", "") or ocr.get("date_of_issue", "") or ""),
-        "department_code": str(ocr.get("department_code", "") or ocr.get("code", "") or ""),
-        "passport_series": str(ocr.get("passport_series", "") or ocr.get("series", "") or ""),
-        "passport_number": str(ocr.get("passport_number", "") or ocr.get("number", "") or ""),
-        "surname": str(ocr.get("surname", "") or ocr.get("last_name", "") or ""),
-        "name": str(ocr.get("name", "") or ocr.get("first_name", "") or ""),
-        "patronymic": str(ocr.get("patronymic", "") or ocr.get("middle_name", "") or ""),
-        "gender": str(ocr.get("gender", "") or ocr.get("sex", "") or ""),
-        "birth_date": str(ocr.get("birth_date", "") or ocr.get("date_of_birth", "") or ""),
-        "birth_place": str(ocr.get("birth_place", "") or ocr.get("place_of_birth", "") or ""),
+        "issuing_authority": _pick_ocr_value(
+            ocr,
+            "Issue_organization_ru",
+            "Issue_organisation_ru",
+            "issuing_authority",
+            "issued_by",
+        ),
+        "issue_date": _pick_ocr_value(ocr, "Issue_date", "issue_date", "date_of_issue"),
+        "department_code": _pick_ocr_value(
+            ocr,
+            "Issue_organisation_code",
+            "Issue_organization_code",
+            "department_code",
+            "code",
+        ),
+        "passport_series": passport_series or _pick_ocr_value(ocr, "passport_series", "series"),
+        "passport_number": passport_number or _pick_ocr_value(ocr, "passport_number", "number"),
+        "surname": _pick_ocr_value(ocr, "Last_name_ru", "surname", "last_name"),
+        "name": _pick_ocr_value(ocr, "First_name_ru", "name", "first_name"),
+        "patronymic": _pick_ocr_value(ocr, "Middle_name_ru", "patronymic", "middle_name"),
+        "gender": _pick_ocr_value(ocr, "Sex_ru", "gender", "sex"),
+        "birth_date": _pick_ocr_value(ocr, "Birth_date", "birth_date", "date_of_birth"),
+        "birth_place": _pick_ocr_value(ocr, "Birth_place_ru", "birth_place", "place_of_birth"),
         "confidence_note": "Экспериментальный результат RussianDocsOCR Pipeline.",
     }
 
@@ -165,12 +224,18 @@ async def scan_passport_russian_docs_ocr(
 
     parsed = _normalize_russian_docs_passport(raw.get("ocr"))
     data = normalize_passport_data(parsed)
-    _log(scan_id, "request", "finish")
+    _log(
+        scan_id,
+        "request",
+        "finish",
+        has_passport_number=bool(data.passport_series and data.passport_number),
+        has_fio=bool(data.surname and data.name),
+    )
     return PassportScanResponse(
         ok=True,
         model=f"RussianDocsOCR:{model_format}:{device}",
         data=data,
-        raw_text=str(raw),
+        raw_text=_compact_raw_payload(raw),
     )
 
 
