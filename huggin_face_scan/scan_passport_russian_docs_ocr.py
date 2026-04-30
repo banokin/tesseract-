@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import importlib
 import json
 import logging
@@ -42,6 +43,25 @@ class RussianDocsOcrDebug(BaseModel):
 def _log(scan_id: str, stage: str, event: str, **fields: Any) -> None:
     suffix = " ".join(f"{key}={value!r}" for key, value in fields.items())
     logger.info("russian-docs-ocr %s: %s scan_id=%s %s", stage, event, scan_id, suffix)
+
+
+def _file_debug_payload(file: UploadFile, contents: bytes) -> dict[str, Any]:
+    return {
+        "filename": file.filename or "",
+        "content_type": file.content_type or "",
+        "bytes": len(contents),
+        "sha256_12": hashlib.sha256(contents).hexdigest()[:12],
+    }
+
+
+def _duplicate_file_warnings(files: dict[str, dict[str, Any]]) -> list[str]:
+    warnings: list[str] = []
+    items = list(files.items())
+    for index, (left_key, left) in enumerate(items):
+        for right_key, right in items[index + 1 :]:
+            if left.get("sha256_12") and left.get("sha256_12") == right.get("sha256_12"):
+                warnings.append(f"{left_key} и {right_key}: одинаковый sha256_12")
+    return warnings
 
 
 async def _prepare_image_bytes(contents: bytes, content_type: str, scan_id: str) -> tuple[bytes, str]:
@@ -171,6 +191,56 @@ def _looks_like_passport_main_page(raw: dict[str, Any], text: str) -> bool:
     matched_keys = passport_keys.intersection(ocr.keys())
     has_registration_words = bool(re.search(r"(регистрац|место\s+жительства|зарегистрирован)", text, re.I))
     return len(matched_keys) >= 4 and not has_registration_words
+
+
+def _looks_like_issuing_authority(value: str) -> bool:
+    text = re.sub(r"\s+", " ", str(value or "").strip().upper())
+    if not text:
+        return False
+    has_authority_words = bool(re.search(r"(ОТДЕЛОМ|ОТДЕЛ\s+|УФМС|МВД|ГУВМ|ОВД|РОССИИ|ВЫДАН|КОД\s+ПОДРАЗД)", text))
+    has_address_words = bool(
+        re.search(r"(УЛ\.|УЛИЦА|Д\.|ДОМ|КВ\.|КВАРТИРА|ПР-КТ|ПРОСПЕКТ|ПЕР\.|ПЕРЕУЛОК|Ш\.|ШОССЕ)", text)
+    )
+    return has_authority_words and not has_address_words
+
+
+def _clear_invalid_registration_address(registration_data: Any) -> None:
+    suspicious_values = [
+        registration_data.address,
+        registration_data.region,
+        registration_data.city,
+        registration_data.settlement,
+        registration_data.street,
+    ]
+    if not any(_looks_like_issuing_authority(value) for value in suspicious_values):
+        return
+    registration_data.address = ""
+    registration_data.region = ""
+    registration_data.city = ""
+    registration_data.settlement = ""
+    registration_data.street = ""
+    registration_data.house = ""
+    registration_data.building = ""
+    registration_data.apartment = ""
+    note = "OCR вернул орган выдачи вместо адреса регистрации; заполните адрес вручную."
+    registration_data.confidence_note = f"{registration_data.confidence_note}; {note}".strip("; ")
+
+
+def _clear_invalid_egrn_data(egrn_data: Any, passport_data: Any, *, source_is_passport: bool) -> None:
+    has_core_egrn_fields = bool(egrn_data.cadastral_number or egrn_data.address or egrn_data.right_holders)
+    passport_dates = {passport_data.birth_date, passport_data.issue_date} - {""}
+    date_looks_copied_from_passport = bool(egrn_data.extract_date and egrn_data.extract_date in passport_dates)
+    if not source_is_passport and (has_core_egrn_fields or not date_looks_copied_from_passport):
+        return
+    egrn_data.cadastral_number = ""
+    egrn_data.object_type = ""
+    egrn_data.address = ""
+    egrn_data.area_sq_m = ""
+    egrn_data.ownership_type = ""
+    egrn_data.right_holders = []
+    egrn_data.extract_date = ""
+    note = "RussianDocsOCR распознал файл ЕГРН как паспортный разворот; заполните данные ЕГРН вручную."
+    egrn_data.confidence_note = f"{egrn_data.confidence_note}; {note}".strip("; ")
 
 
 async def _scan_file_with_russian_docs(
@@ -375,6 +445,21 @@ async def scan_documents_russian_docs_ocr(
     main_bytes = await passport_main.read()
     registration_bytes = await passport_registration.read()
     egrn_bytes = await egrn_extract.read()
+    files_debug = {
+        "passport_main": _file_debug_payload(passport_main, main_bytes),
+        "passport_registration": _file_debug_payload(passport_registration, registration_bytes),
+        "egrn_extract": _file_debug_payload(egrn_extract, egrn_bytes),
+    }
+    file_warnings = _duplicate_file_warnings(files_debug)
+    _log(
+        scan_id,
+        "unified_request",
+        "files_read",
+        passport_main=files_debug["passport_main"],
+        passport_registration=files_debug["passport_registration"],
+        egrn_extract=files_debug["egrn_extract"],
+        warnings=file_warnings,
+    )
 
     main_raw, passport_raw, main_text = await _scan_file_with_russian_docs(
         main_bytes,
@@ -415,7 +500,20 @@ async def scan_documents_russian_docs_ocr(
         )
     else:
         registration_data = normalize_registration_data(parse_registration_ocr_text(reg_text))
-    egrn_data = normalize_egrn_data(parse_egrn_ocr_text(egrn_text))
+    _clear_invalid_registration_address(registration_data)
+    egrn_source_is_passport = _looks_like_passport_main_page(egrn_raw, egrn_text)
+    if egrn_source_is_passport:
+        egrn_data = normalize_egrn_data(
+            {
+                "confidence_note": (
+                    "RussianDocsOCR распознал файл ЕГРН как основной разворот паспорта; "
+                    "заполните данные ЕГРН вручную."
+                )
+            }
+        )
+    else:
+        egrn_data = normalize_egrn_data(parse_egrn_ocr_text(egrn_text))
+    _clear_invalid_egrn_data(egrn_data, passport_data, source_is_passport=egrn_source_is_passport)
 
     # If the registration page is recognized as a passport page, keep its OCR visible for manual review.
     if not (registration_data.address or registration_data.region or registration_data.city):
@@ -450,6 +548,8 @@ async def scan_documents_russian_docs_ocr(
             "passport_main": passport_raw,
             "passport_registration": f"{reg_debug}\n\n--- russian_docs_ocr_text ---\n{reg_text}",
             "egrn_extract": f"{egrn_debug}\n\n--- russian_docs_ocr_text ---\n{egrn_text}",
+            "_files": json.dumps(files_debug, ensure_ascii=False, indent=2),
+            "_warnings": json.dumps(file_warnings, ensure_ascii=False, indent=2),
         },
     )
 
