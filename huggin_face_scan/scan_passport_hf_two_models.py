@@ -2,9 +2,12 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import re
 from collections import Counter
+from contextvars import ContextVar
 from typing import Any, Dict
+from uuid import uuid4
 
 from fastapi import APIRouter, File, HTTPException, UploadFile
 from pydantic import BaseModel
@@ -35,6 +38,38 @@ from huggin_face_scan.scan_passport_hf import (
 from tesseract_scan.ocr import img_ocr_multi_pass
 
 router = APIRouter(tags=["passport-two-models"])
+logger = logging.getLogger(__name__)
+_scan_id_ctx: ContextVar[str | None] = ContextVar("two_models_scan_id", default=None)
+
+
+def _format_log_fields(fields: dict[str, Any]) -> str:
+    if not fields:
+        return ""
+    return " " + " ".join(f"{key}={value!r}" for key, value in fields.items())
+
+
+def _mask_digits(value: str) -> str:
+    if len(value) <= 4:
+        return "*" * len(value)
+    return f"{value[:2]}{'*' * (len(value) - 4)}{value[-2:]}"
+
+
+def _log_stage(stage: str, event: str, *, level: int = logging.INFO, **fields: Any) -> None:
+    scan_id = _scan_id_ctx.get()
+    extra = {"stage": stage, **fields}
+    if scan_id:
+        extra["scan_id"] = scan_id
+        fields = {"scan_id": scan_id, **fields}
+    logger.log(level, "two-models %s: %s%s", stage, event, _format_log_fields(fields), extra=extra)
+
+
+def _log_stage_exception(stage: str, event: str, **fields: Any) -> None:
+    scan_id = _scan_id_ctx.get()
+    extra = {"stage": stage, **fields}
+    if scan_id:
+        extra["scan_id"] = scan_id
+        fields = {"scan_id": scan_id, **fields}
+    logger.exception("two-models %s: %s%s", stage, event, _format_log_fields(fields), extra=extra)
 
 try:
     import cv2  # type: ignore
@@ -62,9 +97,13 @@ class TwoModelsUnifiedResponse(BaseModel):
 
 
 async def _prepare_ocr_bytes(raw: bytes, content_type: str) -> bytes:
+    _log_stage("prepare_ocr_bytes", "start", content_type=content_type, input_bytes=len(raw))
     if content_type == "application/pdf":
-        return await safe_to_thread(pdf_first_page_to_png, raw)
+        prepared = await safe_to_thread(pdf_first_page_to_png, raw)
+        _log_stage("prepare_ocr_bytes", "pdf_converted", output_bytes=len(prepared))
+        return prepared
     await safe_to_thread(validate_image, raw)
+    _log_stage("prepare_ocr_bytes", "image_validated", output_bytes=len(raw))
     return raw
 
 
@@ -90,9 +129,18 @@ def _prompt_with_ocr_context(prompt: str, ocr_text: str, document_name: str) -> 
 
 
 async def _extract_ocr_text(contents: bytes, *, include_crops: bool = True) -> str:
+    _log_stage(
+        "extract_ocr_text",
+        "start",
+        input_bytes=len(contents),
+        include_crops=include_crops,
+    )
     try:
-        return await safe_to_thread(img_ocr_multi_pass, contents, include_crops=include_crops)
-    except Exception:
+        text = await safe_to_thread(img_ocr_multi_pass, contents, include_crops=include_crops)
+        _log_stage("extract_ocr_text", "success", chars=len(text or ""))
+        return text
+    except Exception as e:
+        _log_stage_exception("extract_ocr_text", "failed", error_repr=repr(e))
         return ""
 
 
@@ -128,16 +176,21 @@ def _order_quad_points(points: "np.ndarray") -> "np.ndarray":
 
 
 def _preprocess_for_passport_number(contents: bytes) -> bytes:
+    _log_stage("passport_number_preprocess", "start", input_bytes=len(contents))
     if cv2 is None or np is None:
+        _log_stage("passport_number_preprocess", "opencv_unavailable")
         return contents
 
     arr = np.frombuffer(contents, np.uint8)
     image = cv2.imdecode(arr, cv2.IMREAD_COLOR)
     if image is None:
+        _log_stage("passport_number_preprocess", "image_decode_failed", level=logging.WARNING)
         return contents
 
     try:
         gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+        h, w = gray.shape[:2]
+        _log_stage("passport_number_preprocess", "decoded", width=w, height=h)
 
         # CLAHE improves local contrast on dark/uneven mobile photos.
         clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
@@ -152,6 +205,7 @@ def _preprocess_for_passport_number(contents: bytes) -> bytes:
                 angle = 90 + angle
             if abs(angle) > 0.3:
                 h, w = gray.shape[:2]
+                _log_stage("passport_number_preprocess", "deskew", angle=round(float(angle), 3))
                 matrix = cv2.getRotationMatrix2D((w / 2, h / 2), angle, 1.0)
                 gray = cv2.warpAffine(
                     gray,
@@ -179,6 +233,12 @@ def _preprocess_for_passport_number(contents: bytes) -> bytes:
                 height_b = np.linalg.norm(tl - bl)
                 max_h = max(int(height_a), int(height_b))
                 if max_w > 0 and max_h > 0:
+                    _log_stage(
+                        "passport_number_preprocess",
+                        "perspective_correction",
+                        width=max_w,
+                        height=max_h,
+                    )
                     dst = np.array(
                         [[0, 0], [max_w - 1, 0], [max_w - 1, max_h - 1], [0, max_h - 1]],
                         dtype="float32",
@@ -188,8 +248,16 @@ def _preprocess_for_passport_number(contents: bytes) -> bytes:
                 break
 
         ok, encoded = cv2.imencode(".jpg", gray)
-        return encoded.tobytes() if ok else contents
-    except Exception:
+        result = encoded.tobytes() if ok else contents
+        _log_stage(
+            "passport_number_preprocess",
+            "finish",
+            encoded=ok,
+            output_bytes=len(result),
+        )
+        return result
+    except Exception as e:
+        _log_stage_exception("passport_number_preprocess", "failed", error_repr=repr(e))
         return contents
 
 
@@ -214,15 +282,19 @@ def _preprocess_number_crop(rotated_crop: "np.ndarray") -> bytes | None:
 
 
 def _build_passport_number_variants(contents: bytes) -> list[tuple[str, bytes]]:
+    _log_stage("passport_number_variants", "start", input_bytes=len(contents))
     if cv2 is None or np is None:
+        _log_stage("passport_number_variants", "opencv_unavailable", variants=1)
         return [("original", contents)]
 
     arr = np.frombuffer(contents, np.uint8)
     image = cv2.imdecode(arr, cv2.IMREAD_GRAYSCALE)
     if image is None:
+        _log_stage("passport_number_variants", "image_decode_failed", level=logging.WARNING, variants=1)
         return [("original", contents)]
 
     h, w = image.shape[:2]
+    _log_stage("passport_number_variants", "decoded", width=w, height=h)
     crops: dict[str, "np.ndarray"] = {
         "right_vertical": image[int(h * 0.05) : int(h * 0.95), int(w * 0.78) : int(w * 0.98)],
         "left_vertical": image[int(h * 0.05) : int(h * 0.95), int(w * 0.02) : int(w * 0.22)],
@@ -234,6 +306,7 @@ def _build_passport_number_variants(contents: bytes) -> list[tuple[str, bytes]]:
     variants: list[tuple[str, bytes]] = []
     for crop_name, crop in crops.items():
         if crop.size == 0:
+            _log_stage("passport_number_variants", "empty_crop_skipped", crop=crop_name)
             continue
         # Rotate the raw crop first; OCR/VLM reads horizontal digits more reliably after that.
         for rotation_name, rotated_crop in _make_rotation_variants(crop).items():
@@ -241,7 +314,11 @@ def _build_passport_number_variants(contents: bytes) -> list[tuple[str, bytes]]:
             if encoded is not None:
                 variants.append((f"{crop_name}:{rotation_name}", encoded))
 
-    return variants or [("original", contents)]
+    if variants:
+        _log_stage("passport_number_variants", "built", variants=len(variants))
+        return variants
+    _log_stage("passport_number_variants", "fallback_original", variants=1)
+    return [("original", contents)]
 
 
 def _sanitize_passport_digits(raw_value: str) -> str:
@@ -280,6 +357,7 @@ def _extract_json_object(text: str) -> dict[str, str]:
 
 
 def _validate_passport_series_number(raw_text: str, model_name: str) -> tuple[str, str]:
+    _log_stage("validate_passport_number", "start", model=model_name, raw_chars=len(raw_text or ""))
     payload = _extract_json_object(raw_text)
     series_raw = payload.get("series", "")
     number_raw = payload.get("number", "")
@@ -289,9 +367,17 @@ def _validate_passport_series_number(raw_text: str, model_name: str) -> tuple[st
         # Fallback: try to extract 10 digits from plain model text.
         fallback = _sanitize_passport_digits(raw_text)
         if len(fallback) >= 10:
+            _log_stage("validate_passport_number", "json_incomplete_plain_text_fallback", model=model_name)
             direct = fallback[:10]
 
     if len(direct) != 10:
+        _log_stage(
+            "validate_passport_number",
+            "failed_length",
+            level=logging.WARNING,
+            model=model_name,
+            digit_count=len(direct),
+        )
         raise HTTPException(
             status_code=422,
             detail=(
@@ -303,10 +389,18 @@ def _validate_passport_series_number(raw_text: str, model_name: str) -> tuple[st
     series, number = direct[:4], direct[4:]
     full = f"{series}{number}"
     if full in {"0000000000", "1111111111", "1234567890", "0123456789", "9999999999"}:
+        _log_stage(
+            "validate_passport_number",
+            "failed_suspicious_value",
+            level=logging.WARNING,
+            model=model_name,
+            value_masked=_mask_digits(full),
+        )
         raise HTTPException(
             status_code=422,
             detail=f"Распознан технически валидный, но подозрительный номер паспорта ({model_name}).",
         )
+    _log_stage("validate_passport_number", "success", model=model_name, value_masked=_mask_digits(full))
     return series, number
 
 
@@ -333,16 +427,25 @@ def _is_valid_passport_full(full: str) -> bool:
 
 
 def _extract_registration_passport_from_ocr(ocr_text: str) -> tuple[str | None, str | None, str]:
+    _log_stage("registration_passport_ocr", "start", ocr_chars=len(ocr_text or ""))
     if not ocr_text.strip():
+        _log_stage("registration_passport_ocr", "empty")
         return None, None, "ocr_empty"
     try:
         parsed = parse_passport_ocr_text(ocr_text)
-    except Exception:
+    except Exception as e:
+        _log_stage_exception("registration_passport_ocr", "parser_failed", error_repr=repr(e))
         parsed = {}
     series = _sanitize_passport_digits(str(parsed.get("passport_series", "") or ""))[:4]
     number = _sanitize_passport_digits(str(parsed.get("passport_number", "") or ""))[:6]
     if _is_valid_passport_full(_passport_full(series, number)):
+        _log_stage(
+            "registration_passport_ocr",
+            "success",
+            value_masked=_mask_digits(_passport_full(series, number)),
+        )
         return series, number, "ocr_parser"
+    _log_stage("registration_passport_ocr", "not_found", series_chars=len(series), number_chars=len(number))
     return None, None, "ocr_not_found"
 
 
@@ -351,8 +454,16 @@ async def _extract_registration_passport_number(
     registration_ocr_text: str,
     model_name: str,
 ) -> tuple[str | None, str | None, str]:
+    _log_stage(
+        "registration_passport_number",
+        "start",
+        model=model_name,
+        input_bytes=len(registration_bytes),
+        ocr_chars=len(registration_ocr_text or ""),
+    )
     ocr_series, ocr_number, ocr_source = _extract_registration_passport_from_ocr(registration_ocr_text)
     if ocr_series and ocr_number:
+        _log_stage("registration_passport_number", "ocr_success", model=model_name, source=ocr_source)
         return ocr_series, ocr_number, ocr_source
 
     prompt = _prompt_with_ocr_context(
@@ -368,18 +479,34 @@ async def _extract_registration_passport_number(
         "страница регистрации паспорта РФ",
     )
     try:
+        _log_stage("registration_passport_number", "vlm_start", model=model_name, ocr_source=ocr_source)
         raw_text, _ = await run_hf_document_extraction(
             registration_bytes,
             prompt,
             max_tokens=120,
             model_name=model_name,
         )
-    except Exception:
+        _log_stage(
+            "registration_passport_number",
+            "vlm_response",
+            model=model_name,
+            raw_chars=len(raw_text or ""),
+        )
+    except Exception as e:
+        _log_stage_exception(
+            "registration_passport_number",
+            "vlm_failed",
+            model=model_name,
+            ocr_source=ocr_source,
+            error_repr=repr(e),
+        )
         return None, None, f"{ocr_source}+vlm_error"
 
     series, number = _validate_passport_series_number_no_raise(raw_text, model_name)
     if series and number:
+        _log_stage("registration_passport_number", "vlm_success", model=model_name, ocr_source=ocr_source)
         return series, number, f"{ocr_source}+vlm"
+    _log_stage("registration_passport_number", "not_found", model=model_name, ocr_source=ocr_source)
     return None, None, f"{ocr_source}+vlm_not_found"
 
 
@@ -440,10 +567,30 @@ async def _extract_series_and_number(
     passport_main_bytes: bytes,
     model_name: str,
 ) -> tuple[str, str, str]:
+    _log_stage(
+        "strict_passport_number",
+        "start",
+        model=model_name,
+        input_bytes=len(passport_main_bytes),
+    )
     preprocessed = await safe_to_thread(_preprocess_for_passport_number, passport_main_bytes)
+    _log_stage(
+        "strict_passport_number",
+        "preprocessed",
+        model=model_name,
+        output_bytes=len(preprocessed),
+    )
     variants_primary = await safe_to_thread(_build_passport_number_variants, preprocessed)
     variants_original = await safe_to_thread(_build_passport_number_variants, passport_main_bytes)
     variants = variants_primary + variants_original[:6]
+    _log_stage(
+        "strict_passport_number",
+        "variants_ready",
+        model=model_name,
+        primary_variants=len(variants_primary),
+        original_variants=len(variants_original),
+        total_variants=len(variants),
+    )
     prompts = [
         (
             "Ты извлекаешь только серию и номер паспорта РФ. "
@@ -467,36 +614,111 @@ async def _extract_series_and_number(
     last_error: HTTPException | None = None
     for prompt_idx, prompt in enumerate(prompts):
         for variant_idx, (variant_name, variant) in enumerate(variants):
-            raw_text, _ = await run_hf_document_extraction(
-                variant,
-                prompt,
-                max_tokens=120,
-                model_name=model_name,
+            _log_stage(
+                "strict_passport_number",
+                "vlm_attempt_start",
+                model=model_name,
+                prompt_idx=prompt_idx,
+                variant_idx=variant_idx,
+                variant=variant_name,
+                variant_bytes=len(variant),
+            )
+            try:
+                raw_text, _ = await run_hf_document_extraction(
+                    variant,
+                    prompt,
+                    max_tokens=120,
+                    model_name=model_name,
+                )
+            except Exception as e:
+                _log_stage_exception(
+                    "strict_passport_number",
+                    "vlm_attempt_failed",
+                    model=model_name,
+                    prompt_idx=prompt_idx,
+                    variant_idx=variant_idx,
+                    variant=variant_name,
+                    error_repr=repr(e),
+                )
+                raise
+            _log_stage(
+                "strict_passport_number",
+                "vlm_attempt_response",
+                model=model_name,
+                prompt_idx=prompt_idx,
+                variant_idx=variant_idx,
+                variant=variant_name,
+                raw_chars=len(raw_text or ""),
             )
             try:
                 series, number = _validate_passport_series_number(raw_text, model_name)
                 debug = f"success prompt={prompt_idx} variant={variant_idx} {variant_name}"
+                _log_stage(
+                    "strict_passport_number",
+                    "success",
+                    model=model_name,
+                    prompt_idx=prompt_idx,
+                    variant_idx=variant_idx,
+                    variant=variant_name,
+                    value_masked=_mask_digits(f"{series}{number}"),
+                )
                 return series, number, f"{debug}\n{raw_text}"
             except HTTPException as e:
                 if e.status_code == 422:
+                    _log_stage(
+                        "strict_passport_number",
+                        "attempt_rejected",
+                        level=logging.WARNING,
+                        model=model_name,
+                        prompt_idx=prompt_idx,
+                        variant_idx=variant_idx,
+                        variant=variant_name,
+                        status_code=e.status_code,
+                    )
                     last_error = e
                     continue
                 raise
 
     if last_error is not None:
         # Last chance: direct plain-text extraction without strict JSON format.
-        raw_text, _ = await run_hf_document_extraction(
-            passport_main_bytes,
-            "Напиши только 10 цифр серии и номера паспорта РФ без пояснений.",
-            max_tokens=80,
-            model_name=model_name,
-        )
+        _log_stage("strict_passport_number", "plain_text_fallback_start", model=model_name)
+        try:
+            raw_text, _ = await run_hf_document_extraction(
+                passport_main_bytes,
+                "Напиши только 10 цифр серии и номера паспорта РФ без пояснений.",
+                max_tokens=80,
+                model_name=model_name,
+            )
+        except Exception as e:
+            _log_stage_exception(
+                "strict_passport_number",
+                "plain_text_fallback_error",
+                model=model_name,
+                error_repr=repr(e),
+            )
+            raise
         digits = _sanitize_passport_digits(raw_text)
         if len(digits) >= 10:
             series, number = digits[:4], digits[4:10]
             if f"{series}{number}" not in {"0000000000", "1111111111", "1234567890", "0123456789", "9999999999"}:
+                _log_stage(
+                    "strict_passport_number",
+                    "plain_text_fallback_success",
+                    model=model_name,
+                    raw_chars=len(raw_text or ""),
+                    value_masked=_mask_digits(f"{series}{number}"),
+                )
                 return series, number, f"fallback plain-text\n{raw_text}"
+        _log_stage(
+            "strict_passport_number",
+            "plain_text_fallback_failed",
+            level=logging.WARNING,
+            model=model_name,
+            raw_chars=len(raw_text or ""),
+            digit_count=len(digits),
+        )
         raise last_error
+    _log_stage("strict_passport_number", "failed_no_attempts", level=logging.ERROR, model=model_name)
     raise HTTPException(
         status_code=422,
         detail=f"Не удалось надежно распознать серию/номер паспорта ({model_name}) после мульти-кропа.",
@@ -512,7 +734,19 @@ async def _scan_with_model(
     egrn_ocr_text: str,
     model_name: str,
 ) -> UnifiedDocumentsScanResponse:
+    _log_stage(
+        "scan_with_model",
+        "start",
+        model=model_name,
+        main_bytes=len(main_ocr_bytes),
+        registration_bytes=len(registration_ocr_bytes),
+        egrn_bytes=len(egrn_ocr_bytes),
+        passport_ocr_chars=len(passport_ocr_text or ""),
+        registration_ocr_chars=len(registration_ocr_text or ""),
+        egrn_ocr_chars=len(egrn_ocr_text or ""),
+    )
     try:
+        _log_stage("scan_with_model", "document_extraction_start", model=model_name)
         (
             (passport_raw, model_used),
             (registration_raw, _),
@@ -541,33 +775,61 @@ async def _scan_with_model(
                 model_name=model_name,
             ),
         )
+        _log_stage(
+            "scan_with_model",
+            "document_extraction_success",
+            model=model_name,
+            model_used=model_used,
+            passport_raw_chars=len(passport_raw or ""),
+            registration_raw_chars=len(registration_raw or ""),
+            egrn_raw_chars=len(egrn_raw or ""),
+        )
     except HTTPException:
+        _log_stage("scan_with_model", "document_extraction_http_error", level=logging.WARNING, model=model_name)
         raise
     except Exception as e:
+        _log_stage_exception("scan_with_model", "document_extraction_failed", model=model_name, error_repr=repr(e))
         raise HTTPException(
             status_code=502,
             detail=f"Ошибка сканирования документов ({model_name}): {e!r}",
         ) from e
 
     # Strict second pass for passport series+number with validation.
+    _log_stage("scan_with_model", "strict_number_start", model=model_name)
     strict_series, strict_number, strict_passport_raw = await _extract_series_and_number(
         main_ocr_bytes,
         model_name,
     )
+    _log_stage(
+        "scan_with_model",
+        "strict_number_success",
+        model=model_name,
+        value_masked=_mask_digits(f"{strict_series}{strict_number}"),
+    )
 
     try:
+        _log_stage("scan_with_model", "passport_json_parse_start", model=model_name)
         passport_payload = extract_json_from_text(passport_raw)
         passport_ocr_payload = parse_passport_ocr_text(passport_ocr_text) if passport_ocr_text else {}
         passport_data = normalize_passport_data(
             _merge_model_with_ocr(passport_payload, passport_ocr_payload)
         )
     except Exception as e:
+        _log_stage_exception("scan_with_model", "passport_json_parse_failed", model=model_name, error_repr=repr(e))
         raise HTTPException(
             status_code=500,
             detail=f"Не удалось разобрать JSON паспорта ({model_name}): {passport_raw[:1000]}",
         ) from e
+    _log_stage(
+        "scan_with_model",
+        "passport_json_parse_success",
+        model=model_name,
+        model_fields=len(passport_payload),
+        ocr_fields=len(passport_ocr_payload),
+    )
 
     try:
+        _log_stage("scan_with_model", "registration_json_parse_start", model=model_name)
         registration_payload = extract_generic_json_from_text(registration_raw)
         registration_ocr_payload = (
             parse_registration_ocr_text(registration_ocr_text) if registration_ocr_text else {}
@@ -576,21 +838,39 @@ async def _scan_with_model(
             _merge_model_with_ocr(registration_payload, registration_ocr_payload)
         )
     except Exception as e:
+        _log_stage_exception("scan_with_model", "registration_json_parse_failed", model=model_name, error_repr=repr(e))
         raise HTTPException(
             status_code=500,
             detail=f"Не удалось разобрать JSON страницы регистрации ({model_name}): {registration_raw[:1000]}",
         ) from e
+    _log_stage(
+        "scan_with_model",
+        "registration_json_parse_success",
+        model=model_name,
+        model_fields=len(registration_payload),
+        ocr_fields=len(registration_ocr_payload),
+    )
 
     try:
+        _log_stage("scan_with_model", "egrn_json_parse_start", model=model_name)
         egrn_payload = extract_generic_json_from_text(egrn_raw)
         egrn_ocr_payload = parse_egrn_ocr_text(egrn_ocr_text) if egrn_ocr_text else {}
         egrn_data = normalize_egrn_data(_merge_model_with_ocr(egrn_payload, egrn_ocr_payload))
     except Exception as e:
+        _log_stage_exception("scan_with_model", "egrn_json_parse_failed", model=model_name, error_repr=repr(e))
         raise HTTPException(
             status_code=500,
             detail=f"Не удалось разобрать JSON выписки ЕГРН ({model_name}): {egrn_raw[:1000]}",
         ) from e
+    _log_stage(
+        "scan_with_model",
+        "egrn_json_parse_success",
+        model=model_name,
+        model_fields=len(egrn_payload),
+        ocr_fields=len(egrn_ocr_payload),
+    )
 
+    _log_stage("scan_with_model", "enrich_start", model=model_name)
     passport_data, registration_data, egrn_data = await asyncio.gather(
         enrich_passport_fields(main_ocr_bytes, passport_data, model_name=model_name),
         enrich_registration_fields(
@@ -600,12 +880,14 @@ async def _scan_with_model(
         ),
         enrich_egrn_fields(egrn_ocr_bytes, egrn_data, model_name=model_name),
     )
+    _log_stage("scan_with_model", "enrich_success", model=model_name)
     passport_data.passport_series = strict_series
     passport_data.passport_number = strict_number
     note = (passport_data.confidence_note or "").strip()
     strict_note = "Серия/номер верифицированы строгим пайплайном (preprocess + JSON validation)."
     passport_data.confidence_note = f"{note} {strict_note}".strip() if note else strict_note
 
+    _log_stage("scan_with_model", "finish", model=model_name, model_used=model_used)
     return UnifiedDocumentsScanResponse(
         ok=True,
         model=model_used,
@@ -632,6 +914,11 @@ def _build_consensus_payload(
     llama_result: UnifiedDocumentsScanResponse,
     tesseract_full: str | None = None,
 ) -> tuple[str, bool, Dict[str, Dict[str, str]]]:
+    _log_stage(
+        "consensus",
+        "start",
+        has_tesseract=bool(tesseract_full),
+    )
     qwen_series = (qwen_result.data.passport_main.passport_series or "").strip()
     qwen_number = (qwen_result.data.passport_main.passport_number or "").strip()
     llama_series = (llama_result.data.passport_main.passport_series or "").strip()
@@ -667,15 +954,27 @@ def _build_consensus_payload(
             "number": tesseract_full[4:10],
             "full": tesseract_full,
         }
+    _log_stage(
+        "consensus",
+        "finish",
+        consensus=consensus,
+        needs_review=needs_review,
+        vote_count=len(votes),
+        top_count=top_count,
+        top_value_masked=_mask_digits(top_value) if top_value else "",
+    )
     return consensus, needs_review, extracted
 
 
 def _extract_with_tesseract(contents: bytes) -> str | None:
+    _log_stage("tesseract_number", "start", input_bytes=len(contents))
     if pytesseract is None or cv2 is None or np is None:
+        _log_stage("tesseract_number", "dependencies_unavailable")
         return None
     arr = np.frombuffer(contents, np.uint8)
     image = cv2.imdecode(arr, cv2.IMREAD_GRAYSCALE)
     if image is None:
+        _log_stage("tesseract_number", "image_decode_failed", level=logging.WARNING)
         return None
     try:
         prepared = cv2.resize(image, None, fx=2.0, fy=2.0, interpolation=cv2.INTER_CUBIC)
@@ -687,9 +986,19 @@ def _extract_with_tesseract(contents: bytes) -> str | None:
         if len(digits) >= 10:
             full = digits[:10]
             if full not in {"0000000000", "1111111111", "1234567890", "0123456789", "9999999999"}:
+                _log_stage(
+                    "tesseract_number",
+                    "success",
+                    raw_chars=len(text or ""),
+                    digit_count=len(digits),
+                    value_masked=_mask_digits(full),
+                )
                 return full
-    except Exception:
+        _log_stage("tesseract_number", "not_found", raw_chars=len(text or ""), digit_count=len(digits))
+    except Exception as e:
+        _log_stage_exception("tesseract_number", "failed", error_repr=repr(e))
         return None
+    _log_stage("tesseract_number", "finish_empty")
     return None
 
 
@@ -699,58 +1008,116 @@ async def scan_documents_unified_two_models(
     passport_registration: UploadFile = File(...),
     egrn_extract: UploadFile = File(...),
 ) -> TwoModelsUnifiedResponse:
+    scan_id = uuid4().hex[:12]
+    _scan_id_ctx.set(scan_id)
+    _log_stage("request", "start")
     main_type = (passport_main.content_type or "").lower()
     reg_type = (passport_registration.content_type or "").lower()
     egrn_type = (egrn_extract.content_type or "").lower()
+    _log_stage(
+        "request",
+        "content_types",
+        passport_main=main_type,
+        passport_registration=reg_type,
+        egrn_extract=egrn_type,
+    )
     if not (main_type.startswith("image/") or main_type == "application/pdf"):
+        _log_stage("request", "invalid_content_type", level=logging.WARNING, field="passport_main", content_type=main_type)
         raise HTTPException(status_code=400, detail="passport_main: загрузите изображение или PDF")
     if not (reg_type.startswith("image/") or reg_type == "application/pdf"):
+        _log_stage(
+            "request",
+            "invalid_content_type",
+            level=logging.WARNING,
+            field="passport_registration",
+            content_type=reg_type,
+        )
         raise HTTPException(status_code=400, detail="passport_registration: загрузите изображение или PDF")
     if not (egrn_type.startswith("image/") or egrn_type == "application/pdf"):
+        _log_stage("request", "invalid_content_type", level=logging.WARNING, field="egrn_extract", content_type=egrn_type)
         raise HTTPException(status_code=400, detail="egrn_extract: поддерживаются изображение или PDF")
 
+    _log_stage("request", "read_files_start")
     main_bytes = await passport_main.read()
     registration_bytes = await passport_registration.read()
     egrn_bytes = await egrn_extract.read()
+    _log_stage(
+        "request",
+        "read_files_success",
+        passport_main_bytes=len(main_bytes),
+        passport_registration_bytes=len(registration_bytes),
+        egrn_extract_bytes=len(egrn_bytes),
+    )
 
+    _log_stage("request", "prepare_ocr_bytes_start")
     main_ocr_bytes, registration_ocr_bytes, egrn_ocr_bytes = await asyncio.gather(
         _prepare_ocr_bytes(main_bytes, main_type),
         _prepare_ocr_bytes(registration_bytes, reg_type),
         _prepare_ocr_bytes(egrn_bytes, egrn_type),
     )
+    _log_stage(
+        "request",
+        "prepare_ocr_bytes_success",
+        passport_main_bytes=len(main_ocr_bytes),
+        passport_registration_bytes=len(registration_ocr_bytes),
+        egrn_extract_bytes=len(egrn_ocr_bytes),
+    )
 
+    _log_stage("request", "ocr_context_start")
     passport_ocr_text, registration_ocr_text, egrn_ocr_text = await asyncio.gather(
         _extract_ocr_text(main_ocr_bytes, include_crops=True),
         _extract_ocr_text(registration_ocr_bytes, include_crops=True),
         _extract_ocr_text(egrn_ocr_bytes, include_crops=True),
     )
-
-    qwen_result, llama_result = await asyncio.gather(
-        _scan_with_model(
-            main_ocr_bytes,
-            registration_ocr_bytes,
-            egrn_ocr_bytes,
-            passport_ocr_text,
-            registration_ocr_text,
-            egrn_ocr_text,
-            QWEN_30_MODEL,
-        ),
-        _scan_with_model(
-            main_ocr_bytes,
-            registration_ocr_bytes,
-            egrn_ocr_bytes,
-            passport_ocr_text,
-            registration_ocr_text,
-            egrn_ocr_text,
-            LLAMA_4_SCOUT_MODEL,
-        ),
+    _log_stage(
+        "request",
+        "ocr_context_success",
+        passport_ocr_chars=len(passport_ocr_text or ""),
+        registration_ocr_chars=len(registration_ocr_text or ""),
+        egrn_ocr_chars=len(egrn_ocr_text or ""),
     )
+
+    _log_stage("request", "two_model_scan_start", qwen_model=QWEN_30_MODEL, llama_model=LLAMA_4_SCOUT_MODEL)
+    try:
+        qwen_result, llama_result = await asyncio.gather(
+            _scan_with_model(
+                main_ocr_bytes,
+                registration_ocr_bytes,
+                egrn_ocr_bytes,
+                passport_ocr_text,
+                registration_ocr_text,
+                egrn_ocr_text,
+                QWEN_30_MODEL,
+            ),
+            _scan_with_model(
+                main_ocr_bytes,
+                registration_ocr_bytes,
+                egrn_ocr_bytes,
+                passport_ocr_text,
+                registration_ocr_text,
+                egrn_ocr_text,
+                LLAMA_4_SCOUT_MODEL,
+            ),
+        )
+    except Exception as e:
+        _log_stage_exception("request", "two_model_scan_failed", error_repr=repr(e))
+        raise
+    _log_stage("request", "two_model_scan_success")
+    _log_stage("request", "tesseract_passport_number_start")
     tesseract_full = await safe_to_thread(_extract_with_tesseract, main_ocr_bytes)
+    _log_stage(
+        "request",
+        "tesseract_passport_number_finish",
+        found=bool(tesseract_full),
+        value_masked=_mask_digits(tesseract_full) if tesseract_full else "",
+    )
+    _log_stage("request", "consensus_start")
     passport_number_consensus, needs_review, extracted_numbers = _build_consensus_payload(
         qwen_result,
         llama_result,
         tesseract_full=tesseract_full,
     )
+    _log_stage("request", "consensus_success", consensus=passport_number_consensus, needs_review=needs_review)
     recommended = {"series": "", "number": ""}
     winner_full = ""
     if not needs_review:
@@ -758,7 +1125,14 @@ async def scan_documents_unified_two_models(
         winner_full = Counter(full_values).most_common(1)[0][0] if full_values else ""
         if len(winner_full) == 10:
             recommended = {"series": winner_full[:4], "number": winner_full[4:10]}
+    _log_stage(
+        "request",
+        "recommendation_ready",
+        has_recommendation=bool(recommended.get("series") and recommended.get("number")),
+        value_masked=_mask_digits(winner_full) if winner_full else "",
+    )
 
+    _log_stage("request", "registration_passport_validation_extract_start")
     (reg_qwen_series, reg_qwen_number, reg_qwen_source), (
         reg_llama_series,
         reg_llama_number,
@@ -770,6 +1144,14 @@ async def scan_documents_unified_two_models(
             registration_ocr_text,
             LLAMA_4_SCOUT_MODEL,
         ),
+    )
+    _log_stage(
+        "request",
+        "registration_passport_validation_extract_success",
+        qwen_source=reg_qwen_source,
+        llama_source=reg_llama_source,
+        qwen_found=bool(reg_qwen_series and reg_qwen_number),
+        llama_found=bool(reg_llama_series and reg_llama_number),
     )
     registration_candidates: Dict[str, str] = {}
     reg_qwen_full = _passport_full(reg_qwen_series, reg_qwen_number)
@@ -786,9 +1168,15 @@ async def scan_documents_unified_two_models(
         full_values = [value.get("full", "") for value in extracted_numbers.values() if value.get("full", "")]
         main_full_for_validation = Counter(full_values).most_common(1)[0][0] if full_values else ""
 
+    _log_stage("request", "registration_validation_start", candidates=len(registration_candidates))
     passport_registration_validation = _build_registration_validation(
         main_full_for_validation,
         registration_candidates,
+    )
+    _log_stage(
+        "request",
+        "registration_validation_success",
+        status=passport_registration_validation.get("status", ""),
     )
     if passport_registration_validation.get("status") != "match":
         needs_review = True
@@ -809,6 +1197,13 @@ async def scan_documents_unified_two_models(
         "passport_registration_validation": str(passport_registration_validation.get("status", "")),
     }
 
+    _log_stage(
+        "request",
+        "finish",
+        consensus=passport_number_consensus,
+        needs_review=needs_review,
+        extracted_sources=",".join(sorted(extracted_numbers.keys())),
+    )
     return TwoModelsUnifiedResponse(
         ok=True,
         models=TWO_MODELS_MAP,
