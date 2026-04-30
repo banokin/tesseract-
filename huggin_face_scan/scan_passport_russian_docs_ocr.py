@@ -70,12 +70,16 @@ def _run_russian_docs_ocr(
     img_size: int,
 ) -> dict[str, Any]:
     try:
-        document_processing = importlib.import_module("document_processing")
+        try:
+            document_processing = importlib.import_module("russian_docs_ocr.document_processing")
+        except ModuleNotFoundError:
+            document_processing = importlib.import_module("document_processing")
         pipeline_cls = getattr(document_processing, "Pipeline")
     except (ModuleNotFoundError, AttributeError) as exc:
         raise RuntimeError(
-            "Не установлен RussianDocsOCR. Клонируйте репозиторий и установите зависимости "
-            "или добавьте пакет document_processing в PYTHONPATH."
+            "Не установлен RussianDocsOCR. Установите зависимость из GitHub: "
+            "pip install 'russian_docs_ocr @ git+https://github.com/protei300/RussianDocsOCR.git' "
+            "или добавьте пакет russian_docs_ocr/document_processing в PYTHONPATH."
         ) from exc
 
     pipeline = pipeline_cls(model_format=model_format, device=device)

@@ -11,10 +11,12 @@ click==8.3.1
 fastapi==0.135.1
 huggingface_hub==0.36.2
 openai==2.29.0
+opencv-python==4.10.0.84
 gitdb==4.0.12
 GitPython==3.1.46
 h11==0.16.0
 idna==3.11
+imutils==0.5.4
 Jinja2==3.1.6
 jsonschema==4.26.0
 jsonschema-specifications==2025.9.1
@@ -40,6 +42,8 @@ pytz==2026.1.post1
 referencing==0.37.0
 requests==2.32.5
 rpds-py==0.30.0
+rupasportread==0.9.11
+russian_docs_ocr @ git+https://github.com/protei300/RussianDocsOCR.git
 six==1.17.0
 smmap==5.0.3
 starlette==0.52.1
