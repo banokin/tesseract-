@@ -1,0 +1,11 @@
+# Optional dependency for /scan-passport-russian-docs-ocr.
+#
+# RussianDocsOCR pins old versions of numpy/pandas/Pillow in its pyproject.toml.
+# Install it without transitive dependencies after the main requirements:
+#
+#   pip install -r requirements.txt
+#   pip install -r requirements-russian-docs-ocr-runtime.txt
+#   pip install --no-deps -r requirements-russian-docs-ocr.txt
+#
+# The main requirements already provide the runtime stack used by this backend.
+russian_docs_ocr @ git+https://github.com/protei300/RussianDocsOCR.git

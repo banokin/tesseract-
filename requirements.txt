@@ -43,7 +43,6 @@ referencing==0.37.0
 requests==2.32.5
 rpds-py==0.30.0
 rupasportread==0.9.11
-russian_docs_ocr @ git+https://github.com/protei300/RussianDocsOCR.git
 six==1.17.0
 smmap==5.0.3
 starlette==0.52.1
